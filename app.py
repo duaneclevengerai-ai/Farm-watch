@@ -6,8 +6,9 @@ What it does
   - People create accounts and log in. Each person sees only their own farms.
   - Farmers add a farm by tapping its corners on a satellite map.
   - Every day it fetches Copernicus Sentinel-2 readings (moisture index NDMI, vegetation index NDVI),
-    skipping cloudy passes, and Sentinel-1 radar backscatter, which sees through cloud and gives a relative
-    soil moisture reading for each farm. It also fetches a 7-day weather forecast for each farm.
+    skipping cloudy passes, and fetches a 7-day weather forecast for each farm.
+  - Fields of 2 ha or more are split into zones (2x2 or 3x3) and each zone is measured separately, so the page can
+    show which part of a field is driest, wettest or weakest and say where to inspect.
   - It runs a daily soil-water balance for each field (FAO-56 method): the starting point comes from the satellite
     moisture index, then rain, crop water use, the farmer's irrigation log and field feedback update it day by day.
     The result is irrigation advice (when, and how many mm), stress and disease-risk flags, good spraying days,
@@ -24,7 +25,6 @@ Settings (Render: Environment tab. Vercel: Project > Settings > Environment Vari
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_FROM   optional, enables emailed alerts, briefings and password resets
   APP_URL              optional; your website address, used in password reset emails (Render sets one automatically)
   NDMI_WATCH, NDMI_DRY optional moisture thresholds, default 0.15 and 0.05
-  RADAR_WATCH          optional radar soil moisture threshold (0 to 1 scale), default 0.30
 """
 import base64
 import hashlib
@@ -37,6 +37,7 @@ import secrets
 import smtplib
 import sys
 import time
+import statistics
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -103,32 +104,6 @@ function evaluatePixel(s) {
     ndmi: [(s.B8A - s.B11) / (s.B8A + s.B11)],
     ndvi: [(s.B08 - s.B04) / (s.B08 + s.B04)],
     dataMask: [(s.dataMask === 1 && !bad) ? 1 : 0]
-  };
-}
-"""
-
-RADAR_WATCH = _envf("RADAR_WATCH", 0.30)  # relative radar soil moisture below this, twice in a row: flag
-RADAR_LOOKBACK_DAYS = 365  # radar history pulled the first time; builds each field's dry/wet baseline
-RADAR_CHUNK_DAYS = 180     # keeps each Copernicus request a safe size
-RADAR_MIN_OBS = 30         # readings needed before radar moisture is shown
-RADAR_MIN_COVER = 0.9      # drop radar days where less than 90% of the field is covered
-
-# Sentinel-1 radar: mean VV backscatter in dB over the farm, one value per day. Radar is not affected by cloud.
-RADAR_EVALSCRIPT = """
-//VERSION=3
-function setup() {
-  return {
-    input: [{bands: ["VV", "dataMask"]}],
-    output: [
-      {id: "vv_db", bands: 1},
-      {id: "dataMask", bands: 1}
-    ]
-  };
-}
-function evaluatePixel(s) {
-  return {
-    vv_db: [10 * Math.log10(Math.max(s.VV, 1e-6))],
-    dataMask: [s.dataMask]
   };
 }
 """
@@ -200,10 +175,6 @@ def ensure_schema():
                 date TEXT NOT NULL, ndmi DOUBLE PRECISION NOT NULL,
                 ndvi DOUBLE PRECISION, clear_fraction DOUBLE PRECISION,
                 PRIMARY KEY (farm_id, date))""")
-            sql("""CREATE TABLE IF NOT EXISTS fw_radar (
-                farm_id INTEGER NOT NULL REFERENCES fw_farms(id) ON DELETE CASCADE,
-                date TEXT NOT NULL, vv_db DOUBLE PRECISION NOT NULL,
-                PRIMARY KEY (farm_id, date))""")
             sql("""CREATE TABLE IF NOT EXISTS fw_forecasts (
                 farm_id INTEGER PRIMARY KEY REFERENCES fw_farms(id) ON DELETE CASCADE,
                 fetched TEXT NOT NULL, data TEXT NOT NULL)""")
@@ -218,6 +189,11 @@ def ensure_schema():
                 id SERIAL PRIMARY KEY,
                 farm_id INTEGER NOT NULL REFERENCES fw_farms(id) ON DELETE CASCADE,
                 date TEXT NOT NULL, verdict TEXT NOT NULL, note TEXT, snapshot TEXT)""")
+            sql("""CREATE TABLE IF NOT EXISTS fw_zone_readings (
+                farm_id INTEGER NOT NULL REFERENCES fw_farms(id) ON DELETE CASCADE,
+                zone INTEGER NOT NULL, date TEXT NOT NULL, ndmi DOUBLE PRECISION NOT NULL,
+                ndvi DOUBLE PRECISION, clear_fraction DOUBLE PRECISION,
+                PRIMARY KEY (farm_id, zone, date))""")
             sql("""CREATE TABLE IF NOT EXISTS fw_resets (
                 token_hash TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES fw_users(id) ON DELETE CASCADE,
@@ -404,6 +380,107 @@ def area_ha(geom):
 def centroid(geom):
     ring = geom["coordinates"][0][:-1]
     return sum(p[1] for p in ring) / len(ring), sum(p[0] for p in ring) / len(ring)  # lat, lon
+
+
+ZONE_MIN_HA = 2.0       # fields smaller than this are too small for a meaningful zone map (the moisture bands are 20 m)
+ZONE_DRY_ANOM = 0.06    # a zone this much below the field median moisture is flagged for inspection
+ZONE_WET_ANOM = 0.08    # a zone this much above the median is flagged as unusually wet
+ZONE_NDVI_ANOM = 0.10   # a zone this much below the median greenness is flagged as weak growth
+ZONE_NAMES = {2: ["NW", "NE", "SW", "SE"], 3: ["NW", "N", "NE", "W", "Centre", "E", "SW", "S", "SE"]}
+
+
+def zone_grid(ha):
+    ha = ha or 0
+    return 0 if ha < ZONE_MIN_HA else (2 if ha < 12 else 3)
+
+
+def clip_rect(ring, xmin, ymin, xmax, ymax):
+    """Clip a polygon ring to a rectangle (Sutherland-Hodgman)."""
+    pts = [list(p) for p in (ring[:-1] if ring[0] == ring[-1] else ring)]
+    for axis, bound, keep_ge in ((0, xmin, True), (0, xmax, False), (1, ymin, True), (1, ymax, False)):
+        if not pts:
+            break
+        out = []
+        for i in range(len(pts)):
+            a, b = pts[i - 1], pts[i]
+            ina = a[axis] >= bound if keep_ge else a[axis] <= bound
+            inb = b[axis] >= bound if keep_ge else b[axis] <= bound
+            if ina != inb:
+                tt = (bound - a[axis]) / (b[axis] - a[axis])
+                out.append([a[0] + tt * (b[0] - a[0]), a[1] + tt * (b[1] - a[1])])
+            if inb:
+                out.append(b)
+        pts = out
+    return pts
+
+
+def make_zones(geom, n):
+    """Split a farm polygon into an n x n grid of zones (row 0 is the north edge)."""
+    ring = geom["coordinates"][0]
+    xs, ys = [p[0] for p in ring], [p[1] for p in ring]
+    xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
+    avg = area_ha(geom) / (n * n)
+    zones = []
+    for row in range(n):
+        for col in range(n):
+            x0, x1 = xmin + (xmax - xmin) * col / n, xmin + (xmax - xmin) * (col + 1) / n
+            y1, y0 = ymax - (ymax - ymin) * row / n, ymax - (ymax - ymin) * (row + 1) / n
+            pts = clip_rect(ring, x0, y0, x1, y1)
+            if len(pts) < 3:
+                continue
+            closed = [[round(p[0], 6), round(p[1], 6)] for p in pts]
+            closed.append(closed[0])
+            g = {"type": "Polygon", "coordinates": [closed]}
+            ha = area_ha(g)
+            if ha < max(0.3, 0.2 * avg):
+                continue
+            zones.append({"id": row * n + col, "name": ZONE_NAMES[n][row * n + col], "geometry": g, "ha": ha})
+    return zones
+
+
+def zones_view(geom, ha, rows):
+    """Zones with their latest readings, plus plain-language flags about uneven parts of the field."""
+    n = zone_grid(ha)
+    if not n or len(rows) < 3:
+        return [], [], []
+    try:
+        layout = {z["id"]: z for z in make_zones(geom, n)}
+    except Exception:
+        return [], [], []
+    items = []
+    for r in rows:
+        z = layout.get(int(r["zone"]))
+        if z and _f(r["ndmi"]) is not None:
+            items.append({"id": z["id"], "name": z["name"], "geometry": z["geometry"], "ha": z["ha"],
+                          "ndmi": _f(r["ndmi"]), "ndvi": _f(r["ndvi"]), "date": r["date"]})
+    if len(items) < 3:
+        return [], [], []
+    med = statistics.median(i["ndmi"] for i in items)
+    nd = [i["ndvi"] for i in items if i["ndvi"] is not None]
+    medv = statistics.median(nd) if nd else None
+    dry, wet, weak = [], [], []
+    for i in items:
+        i["status"], i["anomaly"], i["flags"] = status_of(i["ndmi"]), round(i["ndmi"] - med, 3), []
+        if i["anomaly"] <= -ZONE_DRY_ANOM:
+            i["flags"].append("drier"); dry.append(i)
+        elif i["anomaly"] >= ZONE_WET_ANOM:
+            i["flags"].append("wetter"); wet.append(i)
+        if medv is not None and i["ndvi"] is not None and i["ndvi"] <= medv - ZONE_NDVI_ANOM:
+            i["flags"].append("weak"); weak.append(i)
+    flags = []
+    nm = lambda lst: ", ".join(i["name"] for i in sorted(lst, key=lambda x: x["ndmi"]))
+    if dry:
+        flags.append({"kind": "Uneven field", "level": "Check", "text":
+                      f"Drier zones: {nm(dry)} (moisture {abs(min(i['anomaly'] for i in dry)):.2f} or more below the field median). "
+                      "Inspect them: blocked or uneven watering, shallow soil or weaker roots are common causes."})
+    if weak:
+        flags.append({"kind": "Weak growth zone", "level": "Check", "text":
+                      f"Greenness is well below the rest of the field in: {nm(weak)}. Scout there for pests, disease, nutrient or water "
+                      "problems. A satellite cannot tell which."})
+    if wet:
+        flags.append({"kind": "Unusually wet zone", "level": "Info", "text":
+                      f"Wetter than the rest of the field: {nm(wet)}. Check for leaks, overlapping coverage or poor drainage."})
+    return sorted(items, key=lambda x: x["id"]), flags, [i["name"] for i in sorted(dry, key=lambda x: x["ndmi"])]
 
 
 def insert_farm(user_id, name, crop, raw_geometry):
@@ -757,21 +834,24 @@ def risk_flags(readings, days):
     return flags, spray
 
 
-def farm_view(f, readings, days, logs=(), feedback=(), radar=None):
+def farm_view(f, readings, days, logs=(), feedback=(), zone_rows=()):
     last = readings[-1] if readings else None
     status = status_of(last["ndmi"]) if last else None
     fut = days[-7:] if days else days
     flags, spray = risk_flags(readings, fut)
-    flags = flags + radar_flags(radar)
-    rd = ({"series": radar["rows"][-SERIES_LEN:], "latest": radar["rows"][-1]["smi"],
-           "latestDate": radar["rows"][-1]["date"], "threshold": RADAR_WATCH} if radar else None)
+    zones, zflags, zfirst = zones_view(json.loads(f["geometry"]), _f(f["area_ha"]), zone_rows) if zone_rows else ([], [], [])
+    flags = flags + zflags
+    advice = irrigation_advice(f["crop"], status, fut, last["ndmi"] if last else None, logs,
+                               f.get("soil"), f.get("irrigation"), readings, feedback, days)
+    if zfirst and advice["action"] in ("Irrigate", "Plan"):
+        advice["detail"] += " Start with the driest zones: " + ", ".join(zfirst) + "."
+        advice["zonesFirst"] = zfirst
     return {"id": int(f["id"]), "name": f["name"], "crop": f["crop"] or "", "areaHa": _f(f["area_ha"]),
             "soil": f.get("soil") or "", "irrigation": f.get("irrigation") or "",
             "geometry": json.loads(f["geometry"]), "series": readings, "status": status,
-            "forecast": fut, "advice": irrigation_advice(f["crop"], status, fut, last["ndmi"] if last else None, logs,
-                                                       f.get("soil"), f.get("irrigation"), readings, feedback, days),
+            "forecast": fut, "advice": advice, "zones": zones,
             "feedback": feedback[0] if feedback else None, "logs": list(logs)[:15],
-            "risks": flags, "sprayDays": spray, "radar": rd}
+            "risks": flags, "sprayDays": spray}
 
 
 def build_briefing(farms):
@@ -825,15 +905,16 @@ def farms_payload(user_id):
     for fb in sql("SELECT farm_id, date, verdict FROM fw_feedback WHERE date >= $2 AND farm_id IN "
                   "(SELECT id FROM fw_farms WHERE user_id=$1) ORDER BY date DESC, id DESC", (user_id, since)):
         fb_by.setdefault(int(fb["farm_id"]), []).append({"date": fb["date"], "verdict": fb["verdict"]})
-    radar_by = {}
-    since_radar = (date.today() - timedelta(days=RADAR_LOOKBACK_DAYS)).isoformat()
-    for rr in sql("SELECT farm_id, date, vv_db FROM fw_radar WHERE date >= $2 AND farm_id IN "
-                  "(SELECT id FROM fw_farms WHERE user_id=$1) ORDER BY farm_id, date", (user_id, since_radar)):
-        radar_by.setdefault(int(rr["farm_id"]), []).append({"date": rr["date"], "vv": _f(rr["vv_db"])})
+    zr_by = {}
+    for z in sql("SELECT z.farm_id, z.zone, z.date, z.ndmi, z.ndvi FROM fw_zone_readings z JOIN "
+                 "(SELECT farm_id, MAX(date) AS d FROM fw_zone_readings GROUP BY farm_id) m "
+                 "ON z.farm_id = m.farm_id AND z.date = m.d WHERE z.farm_id IN "
+                 "(SELECT id FROM fw_farms WHERE user_id=$1)", (user_id,)):
+        zr_by.setdefault(int(z["farm_id"]), []).append(z)
     with ThreadPoolExecutor(max_workers=5) as pool:
         forecasts = list(pool.map(lambda f: get_forecast(int(f["id"]), _f(f["lat"]), _f(f["lon"])), farms))
     views = [farm_view(f, by.get(int(f["id"]), []), fc, logs_by.get(int(f["id"]), []), fb_by.get(int(f["id"]), []),
-                       radar_moisture(radar_by.get(int(f["id"]), [])))
+                       zr_by.get(int(f["id"]), []))
              for f, fc in zip(farms, forecasts)]
     return {"farms": views, "briefing": build_briefing(views),
             "thresholds": {"watch": NDMI_WATCH, "dry": NDMI_DRY}, "lastFetch": get_meta("last_fetch")}
@@ -907,110 +988,32 @@ def parse_stats(items):
     return out
 
 
-def request_radar(token, geometry, start, end):
-    """Daily mean VV backscatter (dB) over the whole farm, from Sentinel-1 radar."""
-    payload = {
-        "input": {
-            "bounds": {"geometry": geometry,
-                       "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}},
-            "data": [{"type": "sentinel-1-grd",
-                      "dataFilter": {"acquisitionMode": "IW", "polarization": "DV"}}],
-        },
-        "aggregation": {
-            "timeRange": {"from": f"{start}T00:00:00Z", "to": f"{end + timedelta(days=1)}T00:00:00Z"},
-            "aggregationInterval": {"of": "P1D"},
-            "evalscript": RADAR_EVALSCRIPT, "resx": RES_DEG, "resy": RES_DEG,
-        },
-    }
-    for attempt in range(3):
-        req = Request(STATS_URL, data=json.dumps(payload).encode(), method="POST", headers={
-            "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
-        try:
-            with urlopen(req, timeout=120) as r:
-                return json.loads(r.read()).get("data", [])
-        except HTTPError as e:
-            if e.code == 429:
-                time.sleep(5 * (attempt + 1))
-                continue
-            raise RuntimeError(f"Radar error {e.code}: " + e.read().decode("utf-8", "replace")[:200])
-    raise RuntimeError("Rate limited by Copernicus (radar); it will retry on the next run.")
-
-
-def parse_radar(items):
-    """Turn radar API rows into daily backscatter values, dropping days with too little coverage."""
-    out = []
-    for item in items:
-        try:
-            o = item["outputs"]
-            db = float(o["vv_db"]["bands"]["B0"]["stats"]["mean"])
-            cover = float(o["dataMask"]["bands"]["B0"]["stats"]["mean"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if math.isnan(db) or cover < RADAR_MIN_COVER:
-            continue
-        out.append({"date": item["interval"]["from"][:10], "vv": round(db, 2)})
-    return out
-
-
-def fetch_radar_for_farm(token, fid, geometry, today):
-    """Store any radar days we do not have yet for one farm. Returns how many were stored."""
-    last = sql("SELECT MAX(date) AS d FROM fw_radar WHERE farm_id=$1", (fid,))[0]["d"]
-    start = date.fromisoformat(last) + timedelta(days=1) if last else today - timedelta(days=RADAR_LOOKBACK_DAYS)
-    if start > today:
+def fetch_zones(token, farm, d):
+    """Measure each zone of a field on one image date. Returns how many zone readings were stored."""
+    n = zone_grid(_f(farm["area_ha"]))
+    if not n:
         return 0
-    rows, s = [], start
-    while s <= today:
-        e = min(s + timedelta(days=RADAR_CHUNK_DAYS - 1), today)
-        rows += parse_radar(request_radar(token, geometry, s, e))
-        s = e + timedelta(days=1)
-    if not rows:
+    day = date.fromisoformat(d)
+    rows = []
+    for z in make_zones(json.loads(farm["geometry"]), n):
+        for r in parse_stats(request_stats(token, z["geometry"], day, day)):
+            if r["date"] == d:
+                rows.append((int(farm["id"]), z["id"], d, r["ndmi"], r["ndvi"], r["clear"]))
+    if len(rows) < 3:
         return 0
     marks, params = [], []
-    for i, r in enumerate(rows):
-        marks.append("(" + ",".join(f"${i * 3 + k}" for k in range(1, 4)) + ")")
-        params += [fid, r["date"], r["vv"]]
-    stored = sql("INSERT INTO fw_radar (farm_id, date, vv_db) VALUES " + ",".join(marks)
-                 + " ON CONFLICT DO NOTHING RETURNING farm_id", params)
-    return len(stored)
-
-
-def _percentile(sorted_vals, p):
-    k = (len(sorted_vals) - 1) * p / 100
-    lo, hi = math.floor(k), math.ceil(k)
-    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo)
-
-
-def radar_moisture(series):
-    """
-    Relative soil moisture from radar, 0 (driest this field has been in the past year) to 1 (wettest).
-    Change detection: wet soil scatters more radar energy back, so backscatter tracks soil water.
-    Returns None until there is enough history to tell dry from wet.
-    """
-    if len(series) < RADAR_MIN_OBS:
-        return None
-    vals = sorted(r["vv"] for r in series)
-    dry, wet = _percentile(vals, 5), _percentile(vals, 95)
-    if wet - dry < 1.0:  # less than 1 dB of range: nothing reliable to read
-        return None
-    rows = [{"date": r["date"], "vv": r["vv"],
-             "smi": round(max(0.0, min(1.0, (r["vv"] - dry) / (wet - dry))), 3)} for r in series]
-    return {"rows": rows, "dryDb": round(dry, 2), "wetDb": round(wet, 2)}
-
-
-def radar_flags(radar):
-    rows = radar["rows"] if radar else []
-    if len(rows) >= 2 and rows[-1]["smi"] < RADAR_WATCH and rows[-2]["smi"] < RADAR_WATCH:
-        return [{"kind": "Soil dry (radar)", "level": "Check", "text":
-                 f"Radar shows the soil near the driest end of its past-year range on {rows[-1]['date']}. "
-                 "Radar sees through cloud, but it is a relative reading. Check the soil by hand before you irrigate."}]
-    return []
+    for i, row in enumerate(rows):
+        marks.append("(" + ",".join(f"${i * 6 + k}" for k in range(1, 7)) + ")")
+        params += list(row)
+    return len(sql("INSERT INTO fw_zone_readings (farm_id, zone, date, ndmi, ndvi, clear_fraction) VALUES "
+                   + ",".join(marks) + " ON CONFLICT DO NOTHING RETURNING zone", params))
 
 
 def fetch_all(user_id=None):
     """Fetch new satellite readings for one person's farms (or everyone's), in parallel."""
     t0 = time.time()
     token = get_token()
-    cols = "f.id, f.name, f.crop, f.geometry, u.email, u.email_briefing"
+    cols = "f.id, f.name, f.crop, f.geometry, f.area_ha, u.email, u.email_briefing"
     base = f"SELECT {cols} FROM fw_farms f JOIN fw_users u ON u.id = f.user_id"
     farms = sql(base + " WHERE f.user_id=$1 ORDER BY f.id", (user_id,)) if user_id else sql(base + " ORDER BY f.id")
     if not farms:
@@ -1022,38 +1025,47 @@ def fetch_all(user_id=None):
         f"ON r.farm_id = m.farm_id AND r.date = m.d WHERE r.farm_id IN ({ids})")}
     today = date.today()
 
+    zone_have = {int(r["farm_id"]): r["d"] for r in sql(
+        f"SELECT farm_id, MAX(date) AS d FROM fw_zone_readings WHERE farm_id IN ({ids}) GROUP BY farm_id")}
+
     def work(farm):
         name, fid = farm["name"], int(farm["id"])
         try:
             if time.time() - t0 > FETCH_BUDGET_S:
                 return f"{name}: skipped, out of time (it will continue on the next run)", 0, None
-            radar_note = ""
-            try:
-                fetch_radar_for_farm(token, fid, json.loads(farm["geometry"]), today)
-            except Exception as e:  # radar is extra; the optical check should still run
-                print("Radar failed:", name, e, file=sys.stderr)
-                radar_note = f" (radar: {str(e)[:80]})"
             prev = last.get(fid)
             start = date.fromisoformat(prev["date"]) + timedelta(days=1) if prev \
                 else today - timedelta(days=FIRST_LOOKBACK_DAYS)
+            msgs, stored_n, alert, latest = [], 0, None, (prev["date"] if prev else None)
             if start > today:
-                return f"{name}: already up to date", 0, None
-            readings = parse_stats(request_stats(token, json.loads(farm["geometry"]), start, today))
-            if not readings:
-                return f"{name}: no new clear pass yet", 0, None
-            marks, params = [], []
-            for i, r in enumerate(readings):
-                marks.append("(" + ",".join(f"${i * 5 + k}" for k in range(1, 6)) + ")")
-                params += [fid, r["date"], r["ndmi"], r["ndvi"], r["clear"]]
-            stored = sql("INSERT INTO fw_readings (farm_id, date, ndmi, ndvi, clear_fraction) VALUES "
-                         + ",".join(marks) + " ON CONFLICT DO NOTHING RETURNING farm_id", params)
-            alert = None
-            newest = max(readings, key=lambda r: r["date"])
-            if prev and _f(prev["ndmi"]) is not None:
-                before, now = status_of(_f(prev["ndmi"])), status_of(newest["ndmi"])
-                if STATUS_RANK[now] > STATUS_RANK[before]:
-                    alert = (farm["email"], name, farm["crop"], before, now, newest)
-            return f"{name}: stored {len(stored)} new reading(s){radar_note}", len(stored), alert
+                msgs.append("already up to date")
+            else:
+                readings = parse_stats(request_stats(token, json.loads(farm["geometry"]), start, today))
+                if not readings:
+                    msgs.append("no new clear pass yet")
+                else:
+                    marks, params = [], []
+                    for i, r in enumerate(readings):
+                        marks.append("(" + ",".join(f"${i * 5 + k}" for k in range(1, 6)) + ")")
+                        params += [fid, r["date"], r["ndmi"], r["ndvi"], r["clear"]]
+                    stored = sql("INSERT INTO fw_readings (farm_id, date, ndmi, ndvi, clear_fraction) VALUES "
+                                 + ",".join(marks) + " ON CONFLICT DO NOTHING RETURNING farm_id", params)
+                    stored_n = len(stored)
+                    msgs.append(f"stored {stored_n} new reading(s)")
+                    newest = max(readings, key=lambda r: r["date"])
+                    latest = max(latest or "", newest["date"])
+                    if prev and _f(prev["ndmi"]) is not None:
+                        before, now = status_of(_f(prev["ndmi"])), status_of(newest["ndmi"])
+                        if STATUS_RANK[now] > STATUS_RANK[before]:
+                            alert = (farm["email"], name, farm["crop"], before, now, newest)
+            if latest and zone_grid(_f(farm["area_ha"])) and latest > zone_have.get(fid, ""):
+                try:
+                    zn = fetch_zones(token, farm, latest)
+                    if zn:
+                        msgs.append(f"measured {zn} field zones")
+                except Exception as e:
+                    msgs.append(f"zones failed ({e})")
+            return f"{name}: " + ", ".join(msgs), stored_n, alert
         except Exception as e:  # one failing farm should not stop the rest
             return f"{name}: failed ({e})", 0, None
 
@@ -1238,7 +1250,7 @@ ul.brief{margin:6px 0 0;padding-left:18px}ul.brief li{margin-bottom:4px}
       <section class="panel" id="detail" aria-live="polite"></section>
     </div>
     <p class="note"><label style="display:inline;margin:0"><input id="emailPref" type="checkbox"> Email me the morning briefing and moisture alerts</label> <button id="testMail" class="b alt" type="button" style="min-height:34px;padding:2px 12px;margin:0 0 0 8px">Send me a test email</button></p>
-    <p class="note">Guidance only. Irrigation and risk advice is indicative and depends on your soil, crop stage and equipment. Satellite moisture (NDMI) measures canopy moisture, not soil moisture directly. Weather forecast data: Open-Meteo. Radar soil moisture is a relative index until calibrated. Satellite data: Copernicus Sentinel-1 (radar) and Sentinel-2 (optical).</p>
+    <p class="note">Guidance only. Irrigation and risk advice is indicative and depends on your soil, crop stage and equipment. Satellite moisture (NDMI) measures canopy moisture, not soil moisture directly. Weather forecast data: Open-Meteo. Satellite data: Copernicus Sentinel-2.</p>
   </div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
@@ -1318,7 +1330,11 @@ function drawDetailMap(f){
   dmap=L.map(el,{scrollWheelZoom:false});
   L.tileLayer(SAT,{maxZoom:19,attribution:"Tiles &copy; Esri"}).addTo(dmap);
   var ring=f.geometry.coordinates[0].map(function(p){return [p[1],p[0]]});
-  var pl=L.polygon(ring,{color:HEX[lab(f)],weight:3,fillOpacity:0.15}).addTo(dmap);
+  var pl=L.polygon(ring,{color:HEX[lab(f)],weight:3,fillOpacity:(f.zones&&f.zones.length)?0:0.15}).addTo(dmap);
+  (f.zones||[]).forEach(function(z){
+    var zr=z.geometry.coordinates[0].map(function(p){return [p[1],p[0]]});
+    L.polygon(zr,{color:HEX[z.status],weight:1,fillColor:HEX[z.status],fillOpacity:0.4}).bindTooltip(z.name+": "+z.ndmi.toFixed(2)+" ("+z.status+")").addTo(dmap);
+  });
   dmap.fitBounds(pl.getBounds(),{padding:[24,24]});
 }
 function soilChart(tr){
@@ -1330,14 +1346,6 @@ function soilChart(tr){
   return '<svg class="chart" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Projected soil water use"><line x1="'+p+'" x2="'+(W-p)+'" y1="'+Y(100)+'" y2="'+Y(100)+'" stroke="var(--dry)" stroke-dasharray="5 4"/><text x="'+(W-p)+'" y="'+(Y(100)-5)+'" font-size="12" fill="var(--dry)" text-anchor="end">Irrigation trigger (100%)</text>'+
     (ti>0?'<line x1="'+X(ti)+'" x2="'+X(ti)+'" y1="'+p+'" y2="'+(H-p)+'" stroke="var(--line)"/><text x="'+(X(ti)+4)+'" y="'+(p+10)+'" font-size="12" fill="var(--mute)">Today</text>':"")+
     '<path d="'+line+'" fill="none" stroke="var(--wet)" stroke-width="2.5"/>'+dots+'<text x="'+p+'" y="'+(H-6)+'" font-size="12" fill="var(--mute)">'+wd(tr[0].date)+'</text><text x="'+(W-p)+'" y="'+(H-6)+'" font-size="12" fill="var(--mute)" text-anchor="end">'+wd(tr[tr.length-1].date)+'</text></svg>';
-}
-function radarChart(s,thr){
-  if(!s||s.length<2)return "";
-  var W=640,H=150,p=28;
-  var X=function(i){return p+i*(W-2*p)/(s.length-1)},Y=function(v){return H-p-Math.max(0,Math.min(1,v))*(H-2*p)};
-  var line=s.map(function(x,i){return (i?"L":"M")+X(i)+" "+Y(x.smi)}).join(" ");
-  var dots=s.map(function(x,i){return '<circle cx="'+X(i)+'" cy="'+Y(x.smi)+'" r="3" fill="var(--wet)"><title>'+x.date+": "+Math.round(x.smi*100)+'%</title></circle>'}).join("");
-  return '<svg class="chart" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Radar soil moisture over time"><line x1="'+p+'" x2="'+(W-p)+'" y1="'+Y(thr)+'" y2="'+Y(thr)+'" stroke="var(--dry)" stroke-dasharray="5 4"/><text x="'+(W-p)+'" y="'+(Y(thr)-5)+'" font-size="12" fill="var(--dry)" text-anchor="end">Dry threshold ('+Math.round(thr*100)+'%)</text><path d="'+line+'" fill="none" stroke="var(--wet)" stroke-width="2.5"/>'+dots+'<text x="'+p+'" y="'+(H-6)+'" font-size="12" fill="var(--mute)">'+s[0].date+'</text><text x="'+(W-p)+'" y="'+(H-6)+'" font-size="12" fill="var(--mute)" text-anchor="end">'+s[s.length-1].date+'</text></svg>';
 }
 function show(i){
   var f=DATA.farms[i];sel=f.id;armed=null;
@@ -1357,17 +1365,17 @@ function show(i){
   }else h+='<p class="help">The weather forecast is unavailable right now.</p>';
   h+='<h3>Pest, disease and stress watch</h3>';
   h+=f.risks.length?f.risks.map(function(r){var c=r.level==="High"?"var(--dry)":r.level==="Info"?"var(--mute)":"var(--watch)";return '<div class="risk"><i style="color:'+c+'">'+esc(r.kind)+' ('+esc(r.level)+')</i><span>'+esc(r.text)+'</span></div>'}).join(""):'<p class="help" style="margin:4px 0 0">No warning signs right now.</p>';
+  h+='<h3>Inside this field</h3>';
+  if(f.zones&&f.zones.length){
+    var FT={drier:"drier than the rest, inspect",wetter:"unusually wet",weak:"weak growth"},zs=f.zones.slice().sort(function(a,b){return a.ndmi-b.ndmi});
+    h+='<p class="help" style="margin:0 0 4px">Latest image '+esc(f.zones[0].date)+'. The coloured patches on the map are these zones, driest first below.</p>'+
+      zs.map(function(z){return '<div class="logrow"><span><b>'+esc(z.name)+'</b> '+z.status+', moisture '+z.ndmi.toFixed(2)+' ('+(z.anomaly>0?"+":"")+z.anomaly.toFixed(2)+' vs field median)'+(z.flags.length?' · <span style="color:var(--watch)">'+esc(z.flags.map(function(x){return FT[x]}).join(", "))+'</span>':'')+'</span>'+(z.flags.length?'<button class="b alt sm" type="button" style="margin:0" data-zlog="'+esc(z.name)+'">I checked it</button>':'')+'</div>'}).join("");
+  }else h+='<p class="help" style="margin:0">'+((f.areaHa||0)>=2?"Zones appear after the next satellite update.":"Fields of 2 ha or more get a zone map that shows which part of the field needs attention.")+'</p>';
   if(f.forecast&&f.forecast.length)h+='<p class="help" style="margin:8px 0 0">'+(f.sprayDays.length?"Good spraying days (calm and dry): "+f.sprayDays.join(", ")+".":"No calm, dry spraying day in the next 5 days.")+'</p>';
   if(l){
     var prev=f.series.length>1?f.series[f.series.length-2]:l,d=l.ndmi-prev.ndmi;
     h+='<h3>Satellite readings</h3><div class="stats"><div><b>'+l.ndmi.toFixed(2)+'</b><span>Moisture index (NDMI)</span></div><div><b>'+(d>0?"+":"")+d.toFixed(2)+'</b><span>Since previous pass</span></div><div><b>'+(l.ndvi==null?"n/a":l.ndvi.toFixed(2))+'</b><span>Greenness (NDVI)</span></div><div><b>'+esc(ago(l.date))+'</b><span>Latest clear image</span></div></div>'+chart(f.series);
   }else h+='<p class="help">No clear satellite image yet. Tap Update satellite data. Passes happen about every 5 days and cloudy ones are skipped.</p>';
-  if(f.radar){
-    var rs=f.radar,rp=Math.round(rs.latest*100),rc=rs.latest<=rs.threshold?"var(--dry)":rs.latest<=rs.threshold+0.2?"var(--watch)":"var(--ok)";
-    h+='<h3>Radar soil moisture (Sentinel-1)</h3><p class="help" style="margin:0 0 4px">Radar sees through cloud. This is a relative reading: 0% is the driest this field has been in the past year, 100% the wettest. It becomes a true percentage once it is calibrated against a soil probe.</p>'+
-      '<div class="stats"><div><b style="color:'+rc+'">'+rp+'%</b><span>Relative moisture, '+esc(ago(rs.latestDate))+'</span></div></div>'+
-      '<div class="bar"><i style="width:'+rp+'%;background:'+rc+'"></i></div>'+radarChart(rs.series,rs.threshold);
-  }
   h+='<h3>Field settings</h3><p class="help" style="margin:0 0 4px">These make the irrigation advice fit your field.</p><div class="two"><div><label for="sc">Crop</label><input id="sc" maxlength="60" value="'+esc(f.crop)+'"></div><div><label for="ss">Soil</label><select id="ss"><option value="">Loam (default)</option><option value="sandy">Sandy (drains fast)</option><option value="loam">Loam</option><option value="clay">Clay (holds water)</option></select></div></div><label for="sm">Irrigation method</label><select id="sm"><option value="">Not sure</option><option value="drip">Drip</option><option value="sprinkler">Sprinkler or pivot</option><option value="flood">Flood or furrow</option></select><button class="b alt sm" type="button" id="setSave">Save field settings</button>';
   var KL={irrigation:"Irrigated",spray:"Sprayed",scouting:"Scouted",other:"Other"},today=new Date().toISOString().slice(0,10);
   h+='<h3>What you did</h3><p class="help" style="margin:0 0 4px">Logging irrigation makes the advice smarter, and helps build your farm record.</p>'+
@@ -1381,6 +1389,9 @@ function show(i){
   $("setSave").addEventListener("click",async function(){
     try{await api("POST","farmsettings",{farmId:f.id,crop:$("sc").value,soil:$("ss").value,method:$("sm").value});say("Field settings saved.");await load()}catch(e){say(e.message,1)}
   });
+  Array.prototype.forEach.call(document.querySelectorAll("[data-zlog]"),function(b){b.addEventListener("click",async function(){
+    try{await api("POST","addlog",{farmId:f.id,kind:"scouting",date:new Date().toISOString().slice(0,10),note:"Checked zone "+b.getAttribute("data-zlog")});say("Logged. Thanks for checking zone "+b.getAttribute("data-zlog")+".");await load()}catch(e){say(e.message,1)}
+  })});
   Array.prototype.forEach.call(document.querySelectorAll("[data-fb]"),function(b){b.addEventListener("click",async function(){
     try{await api("POST","feedback",{farmId:f.id,verdict:b.getAttribute("data-fb")});say("Thanks. Your answer is used to improve this field's advice.");await load()}catch(e){say(e.message,1)}
   })});
@@ -1421,7 +1432,7 @@ async function enter(){
 $("emailPref").addEventListener("change",async function(){try{await api("POST","prefs",{emailBriefing:this.checked});say("Saved.")}catch(e){say(e.message,1)}});
 $("testMail").addEventListener("click",async function(){try{await api("POST","testmail");say("Test email sent. Check your inbox and spam folder.")}catch(e){say(e.message,1)}});
 $("fetch").addEventListener("click",async function(){
-  var b=this;b.disabled=true;say("Checking Sentinel-1 radar, Sentinel-2 and the forecast. This can take up to a minute.");
+  var b=this;b.disabled=true;say("Checking Sentinel-2 and the forecast. This can take up to a minute.");
   try{var r=await api("POST","fetch");await load();say(r.stored+" new satellite reading(s) stored. "+(r.messages||[]).slice(0,3).join(" "))}catch(e){say(e.message,1)}
   b.disabled=false;
 });
