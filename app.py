@@ -1738,7 +1738,12 @@ def ask_advisor(user, farm_id, question, image_b64, media):
         hist = sql("SELECT question, answer FROM fw_chats WHERE user_id=$1 AND farm_id IS NULL ORDER BY id DESC LIMIT 4", (user["id"],))
     history = [(h["question"], h["answer"]) for h in reversed(hist)]
     text = f"Farm data:\n{context}\n\nQuestion: {question or 'Please look at this photo.'}"
-    answer = call_ai(AI_SYSTEM, text, image_b64, media, history)
+    try:
+        answer = call_ai(AI_SYSTEM, text, image_b64, media, history)
+    except ConfigError:
+        raise
+    except RuntimeError as e:  # show the AI provider's own message, such as a low credit balance
+        raise ValueError(str(e))
     if not answer:
         raise RuntimeError("The AI returned an empty answer. Please try again.")
     sql("INSERT INTO fw_chats (user_id, farm_id, question, answer, had_image, created) VALUES ($1,$2,$3,$4,$5,$6)",
@@ -2047,16 +2052,50 @@ ul.brief{margin:6px 0 0;padding-left:18px}ul.brief li{margin-bottom:4px}
 .alm h4{margin:10px 0 2px;font-size:14px}
 textarea{resize:vertical}
 .chip{font:inherit;font-size:13px;padding:6px 10px;border-radius:16px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
+
+/* ---------- A1 AI brand theme ---------- */
+:root{--bg:#f3f7f4;--ink:#0f2a20;--mute:#587066;--line:#dbe6e0;--wet:#0f7b5c;--ok:#1a8f55;--g1:#06301f;--g2:#0f7b5c;--g3:#7bd88f;--sh:0 6px 22px rgba(10,60,40,.10)}
+@media (prefers-color-scheme:dark){:root{--bg:#07130e;--panel:#10201a;--ink:#e9f5ee;--mute:#9db5aa;--line:#21382e;--wet:#3ec28f;--ok:#4cd08a;--sh:0 6px 22px rgba(0,0,0,.35)}}
+body{background:radial-gradient(900px 380px at 80% -80px,rgba(60,190,130,.18),transparent 70%),var(--bg);font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;letter-spacing:-.005em}
+header{margin:-14px -16px 18px;padding:max(16px,env(safe-area-inset-top)) 18px 18px;background:linear-gradient(120deg,var(--g1),var(--g2) 70%,#2fb585);color:#fff;border-radius:0 0 26px 26px;box-shadow:0 10px 30px rgba(6,48,31,.28)}
+header h1{display:flex;align-items:center;gap:10px;font-size:23px;font-weight:800;letter-spacing:-.02em;color:#fff}
+header h1 small{display:block;font-size:11px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--g3);margin-top:1px}
+.logo{width:40px;height:40px;border-radius:12px;background:linear-gradient(140deg,#c9f7a1,#3fcf8e);display:grid;place-items:center;font-size:22px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+header .sub{color:rgba(255,255,255,.9)}header .b.alt{color:#fff;border-color:rgba(255,255,255,.45)}
+.panel,.tile{border-radius:18px;box-shadow:var(--sh);border-color:transparent}
+.panel{padding:18px}
+h2{font-size:18px;font-weight:750}
+h3{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:var(--wet);margin:20px 0 6px}
+.tile{position:relative;overflow:hidden;padding:12px 14px}
+.tile:before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:var(--wet)}
+.tile:nth-child(2):before{background:#2f9bd8}.tile:nth-child(3):before{background:#f0a21b}.tile:nth-child(4):before{background:#e0533c}
+.tile b{font-size:28px;font-weight:800}
+.b{background:linear-gradient(135deg,var(--g2),#16a56f);border-radius:12px;box-shadow:0 4px 14px rgba(15,123,92,.30);transition:transform .12s,box-shadow .12s}
+.b:active{transform:scale(.97)}.b.alt,.b.danger{background:var(--panel);box-shadow:none}
+.tabs{background:var(--panel);padding:5px;border-radius:16px;box-shadow:var(--sh)}
+.tabs button{border:0;border-radius:12px;background:transparent;color:var(--mute);font-weight:700}
+.tabs button.on{background:linear-gradient(135deg,var(--g2),#16a56f);color:#fff;box-shadow:0 4px 12px rgba(15,123,92,.35)}
+.item{padding:14px 16px}.item[aria-current=true]{background:linear-gradient(90deg,rgba(15,123,92,.14),transparent);box-shadow:inset 4px 0 0 var(--wet)}
+.adv{border-radius:14px;background:linear-gradient(135deg,rgba(15,123,92,.10),rgba(47,155,216,.08));border-left-width:5px}
+.alm{background:linear-gradient(160deg,rgba(255,196,60,.10),rgba(47,155,216,.07));border-radius:14px;padding:4px 14px 12px}
+.alm h4{color:var(--wet);text-transform:uppercase;letter-spacing:.07em;font-size:12px;margin:14px 0 4px}
+.auth{max-width:440px;padding:26px;background:linear-gradient(180deg,var(--panel),var(--panel));border:1px solid var(--line)}
+.hero{margin:0 0 14px;padding:16px;border-radius:14px;background:linear-gradient(135deg,var(--g1),var(--g2));color:#fff}
+.hero b{display:block;font-size:19px;line-height:1.25;margin-bottom:8px}.hero span{display:block;font-size:14px;opacity:.92;margin-top:3px}
+input:not([type=checkbox]),select,textarea{border-radius:12px;background:var(--panel)}
+input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0 3px rgba(15,123,92,.18);outline:0}
+.msg.ai{border-radius:16px;box-shadow:var(--sh);border-color:transparent}.msg.me{background:linear-gradient(135deg,var(--g2),#16a56f);color:#fff;border-radius:16px}
+.wrap{padding-bottom:max(36px,env(safe-area-inset-bottom))}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <header><h1>Farm Watch</h1><div id="who" class="sub" hidden><span id="whoName"></span> <button id="logout" class="b alt" type="button" style="min-height:36px;margin:0 0 0 8px;padding:4px 12px">Log out</button></div></header>
+  <header><h1><span class="logo" aria-hidden="true">🛰️</span><span>Farm Watch<small>by A1 AI</small></span></h1><div id="who" class="sub" hidden><span id="whoName"></span> <button id="logout" class="b alt" type="button" style="min-height:36px;margin:0 0 0 8px;padding:4px 12px">Log out</button></div></header>
   <p id="status" role="status" aria-live="polite"></p>
 
   <section id="auth" class="panel auth" hidden>
     <h2 id="authTitle">Log in</h2>
-    <p class="sub">Satellite moisture, a 7-day forecast and irrigation advice for your farms.</p>
+    <div class="hero"><b>Know exactly when, where and how much to irrigate.</b><span>🛰️ Satellite moisture for every field</span><span>💧 Daily irrigation plan in mm, m³ and pump hours</span><span>🌦️ 7-day forecast, frost and spray windows</span><span>🌙 Almanac: sun, moon, frost dates, planting windows</span></div>
     <div id="nameRow" hidden><label for="nm">Your name</label><input id="nm" autocomplete="name"></div>
     <div id="emRow"><label for="em">Email</label><input id="em" type="email" autocomplete="email"></div>
     <div id="pwRow"><label for="pw" id="pwLabel">Password</label><input id="pw" type="password" autocomplete="current-password"></div>
@@ -2068,7 +2107,7 @@ textarea{resize:vertical}
   </section>
 
   <div id="app" hidden>
-    <div class="tabs" id="tabs" role="tablist"><button type="button" data-view="Farms" class="on">Farms</button><button type="button" data-view="Advisor">Advisor</button><button type="button" data-view="Labor">Labor</button></div>
+    <div class="tabs" id="tabs" role="tablist"><button type="button" data-view="Farms" class="on">🌾 Farms</button><button type="button" data-view="Advisor">🤖 Advisor</button><button type="button" data-view="Labor">👷 Labor</button></div>
     <div id="viewFarms">
     <div class="panel" id="planCard"></div>
     <div class="panel"><h2>Morning briefing</h2><div id="brief"></div><button id="briefSpeak" class="b alt sm" type="button">🔊 Read aloud</button></div>
@@ -2268,6 +2307,7 @@ function show(i){
     var prev=f.series.length>1?f.series[f.series.length-2]:l,d=l.ndmi-prev.ndmi;
     h+='<h3>Satellite readings</h3><div class="stats"><div><b>'+l.ndmi.toFixed(2)+'</b><span>Moisture index (NDMI)</span></div><div><b>'+(d>0?"+":"")+d.toFixed(2)+'</b><span>Since previous pass</span></div><div><b>'+(l.ndvi==null?"n/a":l.ndvi.toFixed(2))+'</b><span>Greenness (NDVI)</span></div><div><b>'+esc(ago(l.date))+'</b><span>Latest clear image</span></div></div>'+chart(f.series);
   }else h+='<p class="help">No clear satellite image yet. Tap Update satellite data. Passes happen about every 5 days and cloudy ones are skipped.</p>';
+  h+='<h3>🌙 Almanac</h3><div id="alm" class="alm help">Loading sun, moon, frost dates and planting windows…</div>';
   h+='<h3>Field settings</h3><p class="help" style="margin:0 0 4px">These make the irrigation advice fit your field.</p><div class="two"><div><label for="sc">Crop</label><input id="sc" maxlength="60" value="'+esc(f.crop)+'"></div><div><label for="ss">Soil</label><select id="ss"><option value="">Loam (default)</option><option value="sandy">Sandy (drains fast)</option><option value="loam">Loam</option><option value="clay">Clay (holds water)</option></select></div></div><label for="sm">Irrigation method</label><select id="sm"><option value="">Not sure</option><option value="drip">Drip</option><option value="sprinkler">Sprinkler or pivot</option><option value="flood">Flood or furrow</option></select><label for="sf">System flow (m&sup3; per hour, optional)</label><input id="sf" type="number" min="0" step="1" inputmode="decimal" value="'+(f.flow||"")+'"><button class="b alt sm" type="button" id="setSave">Save field settings</button>';
   var KL={irrigation:"Irrigated",spray:"Sprayed",scouting:"Scouted",other:"Other"},today=new Date().toISOString().slice(0,10);
   h+='<h3>What you did</h3><p class="help" style="margin:0 0 4px">Logging irrigation makes the advice smarter, and helps build your farm record.</p>'+
@@ -2276,7 +2316,7 @@ function show(i){
     '<button class="b" type="button" id="logAdd">Save to log</button>'+
     (f.logs&&f.logs.length?'<div style="margin-top:8px">'+f.logs.map(function(g){return '<div class="logrow"><span>'+esc(KL[g.kind]||g.kind)+(g.amount!=null?" "+g.amount+" mm":"")+", "+esc(g.date)+(g.note?" · "+esc(g.note):"")+'</span><button type="button" data-log="'+g.id+'" aria-label="Delete this log entry">×</button></div>'}).join("")+'</div>':'');
   h+='<button class="b danger" type="button" id="del">'+(armed===f.id?"Tap again to delete":"Delete farm")+'</button>';
-  $("detail").innerHTML=h;drawDetailMap(f);
+  $("detail").innerHTML=h;drawDetailMap(f);loadAlmanac(f);
   var mc=$("mapOn");if(mc)mc.addEventListener("change",function(){if(!moist||!dmap)return;if(this.checked)moist.addTo(dmap);else dmap.removeLayer(moist)});
   $("ss").value=f.soil||"";$("sm").value=f.irrigation||"";
   $("setSave").addEventListener("click",async function(){
