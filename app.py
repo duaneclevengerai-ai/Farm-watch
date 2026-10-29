@@ -2255,8 +2255,9 @@ function drawDetailMap(f){
   dmap=L.map(el,{scrollWheelZoom:false});
   L.tileLayer(SAT,{maxZoom:19,attribution:"Tiles &copy; Esri"}).addTo(dmap);
   var ring=f.geometry.coordinates[0].map(function(p){return [p[1],p[0]]});
+  dmap.fitBounds(L.latLngBounds(ring),{padding:[24,24]});
   var pl=L.polygon(ring,{color:HEX[lab(f)],weight:3,fillOpacity:(f.map||(f.zones&&f.zones.length))?0:0.15}).addTo(dmap);
-  if(f.map){var b=f.map.bbox;moist=L.imageOverlay(f.map.url,[[b[1],b[0]],[b[3],b[2]]],{opacity:1}).addTo(dmap);pl.bringToFront()}
+  if(f.map){var b=f.map.bbox;moist=L.imageOverlay(f.map.url,[[b[1],b[0]],[b[3],b[2]]],{opacity:1}).addTo(dmap);try{pl.bringToFront()}catch(e){}}
   (f.zones||[]).forEach(function(z){
     var zr=z.geometry.coordinates[0].map(function(p){return [p[1],p[0]]});
     L.polygon(zr,{color:HEX[z.status],weight:f.map?2:1,fillColor:HEX[z.status],fillOpacity:f.map?0:0.4}).bindTooltip(z.name+": "+z.ndmi.toFixed(2)+" ("+z.status+")").addTo(dmap);
@@ -2316,7 +2317,7 @@ function show(i){
     '<button class="b" type="button" id="logAdd">Save to log</button>'+
     (f.logs&&f.logs.length?'<div style="margin-top:8px">'+f.logs.map(function(g){return '<div class="logrow"><span>'+esc(KL[g.kind]||g.kind)+(g.amount!=null?" "+g.amount+" mm":"")+", "+esc(g.date)+(g.note?" · "+esc(g.note):"")+'</span><button type="button" data-log="'+g.id+'" aria-label="Delete this log entry">×</button></div>'}).join("")+'</div>':'');
   h+='<button class="b danger" type="button" id="del">'+(armed===f.id?"Tap again to delete":"Delete farm")+'</button>';
-  $("detail").innerHTML=h;drawDetailMap(f);loadAlmanac(f);
+  $("detail").innerHTML=h;try{drawDetailMap(f)}catch(e){var de=$("dmap");if(de)de.textContent="Map unavailable."}loadAlmanac(f);
   var mc=$("mapOn");if(mc)mc.addEventListener("change",function(){if(!moist||!dmap)return;if(this.checked)moist.addTo(dmap);else dmap.removeLayer(moist)});
   $("ss").value=f.soil||"";$("sm").value=f.irrigation||"";
   $("setSave").addEventListener("click",async function(){
