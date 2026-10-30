@@ -199,6 +199,9 @@ def ensure_schema():
             sql("ALTER TABLE fw_farms ADD COLUMN IF NOT EXISTS soil TEXT")
             sql("ALTER TABLE fw_farms ADD COLUMN IF NOT EXISTS irrigation TEXT")
             sql("ALTER TABLE fw_farms ADD COLUMN IF NOT EXISTS flow_m3h DOUBLE PRECISION")
+            sql("ALTER TABLE fw_farms ADD COLUMN IF NOT EXISTS budget_mm DOUBLE PRECISION")
+            sql("ALTER TABLE fw_farms ADD COLUMN IF NOT EXISTS season_start TEXT")
+            sql("ALTER TABLE fw_farms ADD COLUMN IF NOT EXISTS season_end TEXT")
             sql("""CREATE TABLE IF NOT EXISTS fw_maps (
                 farm_id INTEGER NOT NULL REFERENCES fw_farms(id) ON DELETE CASCADE,
                 kind TEXT NOT NULL, date TEXT NOT NULL, bbox TEXT NOT NULL, png TEXT NOT NULL,
@@ -557,7 +560,10 @@ METHODS = ("drip", "sprinkler", "flood", "unsure")
 VERDICTS = ("ok", "wetter", "drier")
 
 
-def update_settings(user_id, farm_id, crop, soil, method, flow=None):
+_UNSET = object()
+
+
+def update_settings(user_id, farm_id, crop, soil, method, flow=None, budget=_UNSET, start=_UNSET, end=_UNSET):
     if soil and soil not in SOILS:
         raise ValueError("Choose a soil type from the list.")
     if method and method not in METHODS:
@@ -572,8 +578,28 @@ def update_settings(user_id, farm_id, crop, soil, method, flow=None):
             raise ValueError("Flow must be a number of cubic metres per hour.")
         if not 0 < fl <= 100000:
             raise ValueError("Flow must be between 0 and 100000 cubic metres per hour.")
+    bud = None
+    if budget is not _UNSET and budget not in (None, ""):
+        try:
+            bud = float(budget)
+        except (TypeError, ValueError):
+            raise ValueError("The season water allowance must be a number of millimetres.")
+        if not 1 <= bud <= 10000:
+            raise ValueError("The season water allowance must be between 1 and 10000 mm.")
+    sdt = edt = None
+    if start is not _UNSET and (start or end not in (_UNSET, None, "")):
+        try:
+            sdt = date.fromisoformat(start) if start else None
+            edt = date.fromisoformat(end) if end not in (_UNSET, None, "") else None
+        except (TypeError, ValueError):
+            raise ValueError("Use real dates for the season.")
+        if sdt and edt and edt <= sdt:
+            raise ValueError("The season must end after it starts.")
     sql("UPDATE fw_farms SET crop=$1, soil=$2, irrigation=$3, flow_m3h=$4 WHERE id=$5 AND user_id=$6",
         ((crop or "").strip()[:60], soil or "", method or "", fl, farm_id, user_id))
+    if budget is not _UNSET:
+        sql("UPDATE fw_farms SET budget_mm=$1, season_start=$2, season_end=$3 WHERE id=$4 AND user_id=$5",
+            (bud, sdt.isoformat() if sdt else None, edt.isoformat() if edt else None, farm_id, user_id))
 
 
 def add_feedback(user_id, farm_id, verdict, note):
@@ -663,10 +689,18 @@ def get_forecast(farm_id, lat, lon, force=False):
 
 # ---------- advice: irrigation, stress and disease risk, spraying days ----------
 
-KC = [("rice", 1.15), ("maize", 1.1), ("corn", 1.1), ("tomato", 1.1), ("potato", 1.05), ("soy", 1.05),
+KC = [("grapefruit", 0.65), ("sweet potato", 1.15), ("pineapple", 0.5), ("rice", 1.15), ("maize", 1.1), ("corn", 1.1), ("tomato", 1.1), ("potato", 1.05), ("soy", 1.05),
       ("cotton", 1.1), ("sugar", 1.1), ("sunflower", 1.0), ("wheat", 1.0), ("barley", 0.95), ("lettuce", 0.9),
       ("almond", 0.9), ("grape", 0.7), ("vine", 0.7), ("olive", 0.65), ("citrus", 0.65), ("orange", 0.65),
-      ("lemon", 0.65), ("pumpkin", 1.0), ("squash", 1.0), ("apple", 0.95), ("berry", 0.9), ("alfalfa", 1.15)]
+      ("lemon", 0.65), ("pumpkin", 1.0), ("squash", 1.0), ("apple", 0.95), ("berry", 0.9), ("alfalfa", 1.15),
+      ("pistachio", 1.1), ("walnut", 1.1), ("pecan", 1.1), ("hazelnut", 0.95), ("macadamia", 0.9), ("cashew", 0.9),
+      ("peach", 0.95), ("nectarine", 0.95), ("apricot", 0.95), ("plum", 0.95), ("cherr", 0.95), ("pear", 0.95),
+      ("avocado", 0.85), ("mango", 0.85), ("banana", 1.1), ("coffee", 1.05), ("cocoa", 1.05), ("tea", 1.1),
+      ("date", 0.95), ("pomegranate", 0.85), ("fig", 0.85), ("berr", 0.95), ("hops", 1.05),
+      ("peanut", 1.15), ("sorghum", 1.0), ("canola", 1.15), ("rapeseed", 1.15), ("oat", 1.1), ("rye", 1.0),
+      ("tobacco", 1.1), ("hemp", 1.15), ("bean", 1.1), ("chickpea", 1.0), ("lentil", 1.1), ("pea", 1.15),
+      ("watermelon", 1.0), ("melon", 1.05), ("pepper", 1.05), ("onion", 1.05), ("garlic", 1.0), ("carrot", 1.05),
+      ("cabbage", 1.05), ("broccoli", 1.05), ("cassava", 1.1), ("beet", 1.15)]
 DEFAULT_KC = 0.85  # typical mid-season crop coefficients; tune per crop and growth stage
 
 
@@ -720,11 +754,19 @@ def _irrigation_core(crop, status, days):
 
 SOIL_AWC = {"sandy": 80, "loam": 150, "clay": 170}  # typical plant-available water, mm per metre of root zone
 METHOD_EFF = {"drip": 0.9, "sprinkler": 0.75, "flood": 0.6, "unsure": 0.75}  # share of applied water the crop can use
-ROOT_P = [("rice", 0.5, 0.2), ("maize", 1.0, 0.55), ("corn", 1.0, 0.55), ("tomato", 0.7, 0.4), ("potato", 0.5, 0.35),
+ROOT_P = [("grapefruit", 1.1, 0.5), ("sweet potato", 1.0, 0.65), ("pineapple", 0.5, 0.5), ("rice", 0.5, 0.2), ("maize", 1.0, 0.55), ("corn", 1.0, 0.55), ("tomato", 0.7, 0.4), ("potato", 0.5, 0.35),
           ("soy", 0.8, 0.5), ("cotton", 1.0, 0.65), ("sugar", 1.0, 0.65), ("sunflower", 0.9, 0.45), ("wheat", 1.0, 0.55),
           ("barley", 1.0, 0.55), ("lettuce", 0.35, 0.3), ("almond", 1.0, 0.4), ("grape", 1.0, 0.45), ("vine", 1.0, 0.45),
           ("olive", 1.2, 0.65), ("citrus", 1.0, 0.5), ("orange", 1.0, 0.5), ("lemon", 1.0, 0.5), ("pumpkin", 0.8, 0.4),
-          ("squash", 0.8, 0.5), ("apple", 1.0, 0.5), ("berry", 0.5, 0.4), ("alfalfa", 1.2, 0.55)]
+          ("squash", 0.8, 0.5), ("apple", 1.0, 0.5), ("berry", 0.5, 0.4), ("alfalfa", 1.2, 0.55),
+          ("pistachio", 1.5, 0.4), ("walnut", 1.7, 0.5), ("pecan", 1.5, 0.5), ("hazelnut", 1.0, 0.5), ("macadamia", 1.0, 0.5), ("cashew", 1.2, 0.5),
+          ("peach", 1.0, 0.5), ("nectarine", 1.0, 0.5), ("apricot", 1.0, 0.5), ("plum", 1.0, 0.5), ("cherr", 1.0, 0.5), ("pear", 1.0, 0.5),
+          ("avocado", 0.9, 0.7), ("mango", 1.2, 0.5), ("banana", 0.9, 0.35), ("coffee", 1.0, 0.4), ("cocoa", 0.8, 0.3), ("tea", 0.9, 0.4),
+          ("date", 1.5, 0.5), ("pomegranate", 1.0, 0.5), ("fig", 1.0, 0.5), ("berr", 0.4, 0.3), ("hops", 1.5, 0.5),
+          ("peanut", 0.7, 0.5), ("sorghum", 1.2, 0.55), ("canola", 1.2, 0.6), ("rapeseed", 1.2, 0.6), ("oat", 1.0, 0.55), ("rye", 1.0, 0.6),
+          ("tobacco", 0.8, 0.65), ("hemp", 1.0, 0.5), ("bean", 0.6, 0.45), ("chickpea", 0.6, 0.5), ("lentil", 0.6, 0.5), ("pea", 0.6, 0.35),
+          ("watermelon", 0.8, 0.4), ("melon", 0.8, 0.4), ("pepper", 0.6, 0.3), ("onion", 0.3, 0.3), ("garlic", 0.3, 0.3), ("carrot", 0.5, 0.35),
+          ("cabbage", 0.5, 0.45), ("broccoli", 0.4, 0.45), ("cassava", 0.8, 0.35), ("beet", 0.8, 0.5)]
 MAX_SINGLE_NET = 40  # mm of water to the crop in one irrigation; larger needs are split into passes
 DEFAULT_ROOT_P = (0.8, 0.5)  # root depth in m, share of water the crop can use before it is stressed
 
@@ -943,7 +985,83 @@ def risk_flags(readings, days):
     return flags, spray
 
 
-def farm_view(f, readings, days, logs=(), feedback=(), zone_rows=(), now=None, map_meta=None):
+def water_budget(f, irr, today=None, advice=None):
+    """Season water allowance for one field: what has been used, pace, and when it could run out.
+    Counts only irrigation the person logged, so the figures are only as complete as their log."""
+    budget = _f(f.get("budget_mm"))
+    if not budget or budget <= 0:
+        return None
+    today = today or date.today()
+    try:
+        start = date.fromisoformat(f.get("season_start") or "")
+    except (TypeError, ValueError):
+        start = date(today.year, 1, 1)
+    try:
+        end = date.fromisoformat(f.get("season_end") or "")
+    except (TypeError, ValueError):
+        end = date(start.year, 12, 31)
+    if end <= start:
+        end = date(start.year, 12, 31)
+    total = (end - start).days + 1
+    elapsed = max(0, min(total, (today - start).days + 1))
+    s, e = start.isoformat(), end.isoformat()
+    applied, unlogged = 0.0, 0
+    for lg in irr or []:
+        d = lg.get("date") or ""
+        if s <= d <= e:
+            if lg.get("amount") is None:
+                unlogged += 1
+            else:
+                applied += float(lg["amount"])
+    ha = _f(f.get("area_ha")) or 0
+    used = round(applied / budget * 100)
+    timep = round(elapsed / total * 100)
+    rem = budget - applied
+    fmt = lambda d: "%s %d" % (d.strftime("%b"), d.day)
+    pace = applied / elapsed if elapsed >= 14 else None
+    proj = pace * total if pace is not None else None
+    detail = ""
+    if today < start:
+        status, short, head = "notstarted", "season not started", "The season starts on %s." % fmt(start)
+    elif today > end:
+        status, short, head = "ended", "season ended", "Season finished: %d%% of the allowance was used." % used
+    elif applied > budget:
+        status, short, head = "over", "over budget", "Over budget by %d mm." % round(applied - budget)
+        detail = "You have used %d%% of the season allowance." % used
+    elif pace is None:
+        status, short, head = "early", "too early to project", "%d%% of the allowance used so far." % used
+        detail = "It is too early in the season to project your pace."
+    elif proj > budget * 1.05:
+        status, short = "ahead", "ahead of pace"
+        head = "Ahead of pace: heading for about %d%% of your allowance." % round(proj / budget * 100)
+        if pace > 0:
+            run_out = today + timedelta(days=int(rem / pace))
+            if run_out <= end:
+                detail = "At this pace the allowance runs out around %s." % fmt(run_out)
+    else:
+        status, short = "ontrack", "on track"
+        head = "On track: %d%% used, %d%% of the season gone." % (used, timep)
+    plan_mm = (advice or {}).get("applyMm") if (advice or {}).get("action") in ("Irrigate", "Plan") else None
+    if plan_mm and status not in ("ended", "notstarted"):
+        after = rem - plan_mm
+        detail = (detail + " " if detail else "") + (
+            "This week's plan would use about %d mm, leaving %d mm." % (round(plan_mm), round(after)) if after >= 0
+            else "This week's plan would use about %d mm, which goes %d mm over the allowance." % (round(plan_mm), round(-after)))
+    return {"budgetMm": round(budget), "appliedMm": round(applied), "remainingMm": round(rem), "usedPct": used, "timePct": timep,
+            "appliedM3": round(applied * ha * 10), "budgetM3": round(budget * ha * 10), "projectedPct": round(proj / budget * 100) if proj else None,
+            "status": status, "shortStatus": short, "headline": head, "detail": detail.strip(), "unlogged": unlogged,
+            "seasonStart": s, "seasonEnd": e}
+
+
+def build_budget(views):
+    items = [{"farmId": v["id"], "name": v["name"], "usedPct": v["budget"]["usedPct"], "status": v["budget"]["status"],
+              "shortStatus": v["budget"]["shortStatus"]} for v in views if v.get("budget")]
+    used = sum(v["budget"]["appliedM3"] for v in views if v.get("budget"))
+    allow = sum(v["budget"]["budgetM3"] for v in views if v.get("budget"))
+    return {"items": items, "totalAppliedM3": used, "totalBudgetM3": allow, "totalPct": round(used / allow * 100) if allow else 0}
+
+
+def farm_view(f, readings, days, logs=(), feedback=(), zone_rows=(), now=None, map_meta=None, irr_logs=None):
     last = readings[-1] if readings else None
     status = status_of(last["ndmi"]) if last else None
     fut = days[-7:] if days else days
@@ -957,7 +1075,8 @@ def farm_view(f, readings, days, logs=(), feedback=(), zone_rows=(), now=None, m
         advice["zonesFirst"] = zfirst
     return {"id": int(f["id"]), "name": f["name"], "crop": f["crop"] or "", "areaHa": _f(f["area_ha"]),
             "soil": f.get("soil") or "", "irrigation": f.get("irrigation") or "", "flow": _f(f.get("flow_m3h")),
-            "now": now,
+            "now": now, "budgetMm": _f(f.get("budget_mm")), "seasonStart": f.get("season_start") or "", "seasonEnd": f.get("season_end") or "",
+            "budget": water_budget(f, irr_logs or [], date.today(), advice),
             "map": ({"date": map_meta["date"], "bbox": json.loads(map_meta["bbox"]),
                      "url": f"/api/index?r=map&id={int(f['id'])}&v={map_meta['date']}"} if map_meta else None),
             "geometry": json.loads(f["geometry"]), "series": readings, "status": status,
@@ -1018,7 +1137,7 @@ def build_briefing(farms):
 
 def farms_payload(user_id):
     ensure_schema()
-    farms = sql("SELECT id, name, crop, area_ha, lat, lon, geometry, soil, irrigation, flow_m3h FROM fw_farms WHERE user_id=$1 ORDER BY name", (user_id,))
+    farms = sql("SELECT id, name, crop, area_ha, lat, lon, geometry, soil, irrigation, flow_m3h, budget_mm, season_start, season_end FROM fw_farms WHERE user_id=$1 ORDER BY name", (user_id,))
     rows = sql("SELECT r.farm_id, r.date, r.ndmi, r.ndvi FROM ("
                "SELECT farm_id, date, ndmi, ndvi, ROW_NUMBER() OVER (PARTITION BY farm_id ORDER BY date DESC) AS rn "
                "FROM fw_readings WHERE farm_id IN (SELECT id FROM fw_farms WHERE user_id=$1)) r "
@@ -1036,6 +1155,9 @@ def farms_payload(user_id):
     for fb in sql("SELECT farm_id, date, verdict FROM fw_feedback WHERE date >= $2 AND farm_id IN "
                   "(SELECT id FROM fw_farms WHERE user_id=$1) ORDER BY date DESC, id DESC", (user_id, since)):
         fb_by.setdefault(int(fb["farm_id"]), []).append({"date": fb["date"], "verdict": fb["verdict"]})
+    irr_by = {}
+    for lg in sql("SELECT farm_id, amount, date FROM fw_logs WHERE kind=$2 AND farm_id IN (SELECT id FROM fw_farms WHERE user_id=$1)", (user_id, "irrigation")):
+        irr_by.setdefault(int(lg["farm_id"]), []).append({"amount": _f(lg["amount"]), "date": lg["date"]})
     zr_by = {}
     for z in sql("SELECT z.farm_id, z.zone, z.date, z.ndmi, z.ndvi FROM fw_zone_readings z JOIN "
                  "(SELECT farm_id, MAX(date) AS d FROM fw_zone_readings GROUP BY farm_id) m "
@@ -1048,9 +1170,9 @@ def farms_payload(user_id):
         "SELECT farm_id, date, bbox FROM fw_maps WHERE kind=$2 AND farm_id IN (SELECT id FROM fw_farms WHERE user_id=$1)",
         (user_id, "ndmi"))}
     views = [farm_view(f, by.get(int(f["id"]), []), w[0], logs_by.get(int(f["id"]), []), fb_by.get(int(f["id"]), []),
-                       zr_by.get(int(f["id"]), []), w[1], maps.get(int(f["id"])))
+                       zr_by.get(int(f["id"]), []), w[1], maps.get(int(f["id"])), irr_by.get(int(f["id"]), []))
              for f, w in zip(farms, weather)]
-    return {"farms": views, "briefing": build_briefing(views), "plan": build_plan(views),
+    return {"farms": views, "briefing": build_briefing(views), "plan": build_plan(views), "waterBudget": build_budget(views),
             "thresholds": {"watch": NDMI_WATCH, "dry": NDMI_DRY}, "lastFetch": get_meta("last_fetch")}
 
 
@@ -1387,8 +1509,27 @@ PLANTING = [
     ("rice", "Rice", (7, 28), None, "Needs warm water and soil."),
     ("sunflower", "Sunflower", (0, 21), None, "Soil should be at least 8 to 10°C."),
     ("alfalfa", "Alfalfa", (-21, 7), (-60, -35), "Late-summer sowings need time to establish before winter."),
+    ("peanut", "Peanut", (14, 35), None, "Soil should be at least 18°C. Peanuts need a long, warm season."),
+    ("sorghum", "Sorghum", (14, 35), None, "Soil should be at least 16°C. It tolerates heat and dry spells better than maize."),
+    ("canola", "Canola", (-35, -10), (-70, -45), "Winter canola needs time to establish before the first frost."),
+    ("oat", "Oats", (-42, -14), None, "Sow as soon as the soil can be worked."),
+    ("rye", "Rye", None, (-45, -15), "Cereal rye is sown in autumn. It tolerates cold and poor soil."),
+    ("tobacco", "Tobacco (transplants)", (14, 28), None, "Frost-tender. Set out when the soil is warm."),
+    ("hemp", "Hemp", (0, 21), None, "Check local licensing rules before planting."),
+    ("watermelon", "Watermelon", (14, 35), None, "Soil should be at least 18°C."),
+    ("melon", "Melon", (14, 35), None, "Soil should be at least 18°C."),
+    ("pepper", "Pepper (transplants)", (14, 28), None, "Frost-tender. Needs warm nights."),
+    ("sweet potato", "Sweet potato", (21, 42), None, "Plant slips once the soil is at least 16°C."),
+    ("chickpea", "Chickpea", (-35, -10), None, "Sow early in cool soil."),
+    ("lentil", "Lentil", (-35, -10), None, "Sow early in cool soil."),
+    ("garlic", "Garlic", None, (-7, 28), "Plant cloves in autumn so roots form before the ground freezes."),
+    ("cabbage", "Cabbage and broccoli", (-28, -7), (-90, -60), "Cool-season crops. Heat in summer hurts the heads."),
+    ("broccoli", "Broccoli", (-28, -7), (-90, -60), "A cool-season crop."),
+    ("beet", "Sugar beet", (-35, -10), None, "Sow early when the soil is workable."),
 ]
-PERENNIAL_WORDS = ("grape", "vine", "olive", "almond", "citrus", "orange", "lemon", "apple", "berry", "orchard")
+PERENNIAL_WORDS = ("grape", "vine", "olive", "almond", "citrus", "orange", "lemon", "apple", "berry", "orchard",
+                   "pistachio", "walnut", "pecan", "hazelnut", "macadamia", "cashew", "peach", "nectarine", "apricot", "plum",
+                   "cherr", "pear", "avocado", "mango", "banana", "coffee", "cocoa", "tea", "date", "pomegranate", "fig", "berr", "hops")
 
 
 def moon_info(now=None):
@@ -1535,7 +1676,7 @@ def planting_calendar(frost, today, crop):
             else:
                 status, days = ("soon" if (s - today).days <= 45 else "later"), (s - today).days
             out.append({"crop": name, "season": label, "start": s.isoformat(), "end": e.isoformat(),
-                        "status": status, "days": days, "note": note, "mine": bool(kw in c and c)})
+                        "status": status, "days": days, "note": note, "mine": bool(c and kw in c and not any(k2 != kw and kw in k2 and k2 in c for k2, *_ in PLANTING))})
     return out
 
 
@@ -1991,7 +2132,13 @@ APP_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Farm Watch</title>
+<title>Farm Watch by A1 AI · Satellite irrigation intelligence</title>
+<meta name="description" content="Farm Watch turns Sentinel-2 satellite imagery and local weather into a daily irrigation plan for every field. No sensors required.">
+<meta name="theme-color" content="#0f7b5c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Farm Watch">
+<meta property="og:title" content="Farm Watch by A1 AI"><meta property="og:description" content="Know exactly when, where and how much to irrigate.">
+<link rel="manifest" href="?r=manifest"><link rel="icon" href="?r=icon" type="image/svg+xml">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
 :root{--bg:#eef2f0;--panel:#fff;--ink:#14231f;--mute:#5b6b66;--line:#d3dcd8;--wet:#1f6fb5;--ok:#2f7d4f;--watch:#b87a10;--dry:#b3412e}
@@ -2119,7 +2266,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0
     <div id="addPanel" class="panel" hidden>
       <h2>Add a farm</h2>
       <label for="fn">Farm name</label><input id="fn" maxlength="80">
-      <label for="fc">Crop</label><input id="fc" maxlength="60" placeholder="Wheat, maize, olives…">
+      <datalist id="crops"><option value="Almonds"><option value="Pistachios"><option value="Walnuts"><option value="Pecans"><option value="Hazelnuts"><option value="Macadamia"><option value="Cashews"><option value="Corn (maize)"><option value="Cotton"><option value="Wheat"><option value="Barley"><option value="Oats"><option value="Rye"><option value="Rice"><option value="Soybeans"><option value="Peanuts"><option value="Sorghum"><option value="Canola"><option value="Sunflower"><option value="Sugar beet"><option value="Sugarcane"><option value="Alfalfa"><option value="Tobacco"><option value="Hemp"><option value="Hops"><option value="Dry beans"><option value="Chickpeas"><option value="Lentils"><option value="Peas"><option value="Potatoes"><option value="Sweet potatoes"><option value="Tomatoes"><option value="Peppers"><option value="Onions"><option value="Garlic"><option value="Carrots"><option value="Lettuce"><option value="Cabbage"><option value="Broccoli"><option value="Pumpkin"><option value="Watermelon"><option value="Melons"><option value="Grapes (vineyard)"><option value="Olives"><option value="Citrus (orange, lemon)"><option value="Grapefruit"><option value="Apples"><option value="Pears"><option value="Peaches"><option value="Cherries"><option value="Plums"><option value="Apricots"><option value="Avocados"><option value="Mangoes"><option value="Bananas"><option value="Coffee"><option value="Cocoa"><option value="Tea"><option value="Dates"><option value="Pomegranates"><option value="Figs"><option value="Blueberries"><option value="Strawberries"></datalist><label for="fc">Crop</label><input id="fc" maxlength="60" list="crops" placeholder="Start typing: almonds, cotton, wheat…" autocomplete="off">
       <label for="q">Find the farm on the map</label>
       <div class="bar"><input id="q" placeholder="Village, town or address" aria-label="Search for a place"><button id="go" class="b alt" type="button">Search</button><button id="loc" class="b alt" type="button">My location</button></div>
       <div id="map" aria-label="Map for drawing the farm boundary"></div>
@@ -2176,6 +2323,9 @@ input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0
     <p class="note">Guidance only. Irrigation and risk advice is indicative and depends on your soil, crop stage and equipment. Satellite moisture (NDMI) measures canopy moisture, not soil moisture directly. Weather forecast data: Open-Meteo. Satellite data: Copernicus Sentinel-2.</p>
   </div>
 </div>
+<footer class="foot"><p>By using Farm Watch you agree to the <a href="?r=terms">Terms</a> and <a href="?r=privacy">Privacy Policy</a>. Guidance only, not a substitute for a local agronomist.</p><p><button id="delAcct" type="button" class="b alt" hidden>Delete my account</button></p><p class="d">© 2026 A1 AI</p></footer>
+<style>.foot{max-width:760px;margin:10px auto 40px;padding:0 18px;font-size:13px;color:var(--mute)}.foot a{color:var(--wet);font-weight:600}.foot .d{opacity:.7}</style>
+<script>document.getElementById("delAcct").addEventListener("click",function(){var pw=prompt("This permanently deletes your account, farms, logs and labor records. It cannot be undone.\n\nType your password to confirm:");if(!pw)return;fetch("?r=deleteaccount",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||"Could not delete.");alert("Your account has been deleted.");location.reload()})}).catch(function(e){alert(e.message)})});</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 (function(){
@@ -2204,7 +2354,7 @@ async function api(method,route,body){
 /* ---------- login ---------- */
 var INVITE=false,RESET=(new URLSearchParams(location.search)).get("reset")||"";
 function showAuth(){
-  $("app").hidden=true;$("who").hidden=true;$("auth").hidden=false;
+  $("app").hidden=true;$("who").hidden=true;$("delAcct").hidden=true;$("auth").hidden=false;
   var su=mode==="signup",fg=mode==="forgot",rs=mode==="reset";
   $("authTitle").textContent=su?"Create your account":fg?"Reset your password":rs?"Choose a new password":"Log in";
   $("authGo").textContent=su?"Create account":fg?"Send reset link":rs?"Save new password":"Log in";
@@ -2274,6 +2424,10 @@ function soilChart(tr){
     (ti>0?'<line x1="'+X(ti)+'" x2="'+X(ti)+'" y1="'+p+'" y2="'+(H-p)+'" stroke="var(--line)"/><text x="'+(X(ti)+4)+'" y="'+(p+10)+'" font-size="12" fill="var(--mute)">Today</text>':"")+
     '<path d="'+line+'" fill="none" stroke="var(--wet)" stroke-width="2.5"/>'+dots+'<text x="'+p+'" y="'+(H-6)+'" font-size="12" fill="var(--mute)">'+wd(tr[0].date)+'</text><text x="'+(W-p)+'" y="'+(H-6)+'" font-size="12" fill="var(--mute)" text-anchor="end">'+wd(tr[tr.length-1].date)+'</text></svg>';
 }
+function budgetHtml(f){var b=f.budget;
+  if(!b)return '<h3>💧 Water budget</h3><p class="help" style="margin:0">Set a season water allowance in Field settings below to track how much you have used and whether you are on pace.</p>';
+  var col=b.status==="over"?"#e0533c":b.status==="ahead"?"#f0a21b":"var(--ok)",w=Math.min(100,b.usedPct),t=Math.min(100,b.timePct);
+  return '<h3>💧 Water budget</h3><div class="adv" style="border-left-color:'+col+'"><b>'+esc(b.headline)+'</b><div style="position:relative;height:12px;border-radius:99px;background:var(--line);margin:12px 0 6px;overflow:hidden"><div style="width:'+w+'%;height:100%;background:'+col+'"></div><div style="position:absolute;left:'+t+'%;top:0;bottom:0;width:2px;background:var(--ink);opacity:.6"></div></div><div class="help" style="margin:0">Used '+b.appliedMm+' of '+b.budgetMm+' mm ('+b.appliedM3+' of '+b.budgetM3+' m&sup3;). The line shows how much of the season has passed.</div>'+(b.detail?'<p style="margin:8px 0 0">'+esc(b.detail)+'</p>':'')+'<p class="help" style="margin:6px 0 0">Counts only the irrigation you log.'+(b.unlogged?' '+b.unlogged+' entries have no amount and are not counted.':'')+'</p></div>';}
 function show(i){
   var f=DATA.farms[i];sel=f.id;armed=null;
   Array.prototype.forEach.call(document.querySelectorAll("#list button"),function(b){b.setAttribute("aria-current",b.getAttribute("data-id")==String(f.id))});
@@ -2308,8 +2462,9 @@ function show(i){
     var prev=f.series.length>1?f.series[f.series.length-2]:l,d=l.ndmi-prev.ndmi;
     h+='<h3>Satellite readings</h3><div class="stats"><div><b>'+l.ndmi.toFixed(2)+'</b><span>Moisture index (NDMI)</span></div><div><b>'+(d>0?"+":"")+d.toFixed(2)+'</b><span>Since previous pass</span></div><div><b>'+(l.ndvi==null?"n/a":l.ndvi.toFixed(2))+'</b><span>Greenness (NDVI)</span></div><div><b>'+esc(ago(l.date))+'</b><span>Latest clear image</span></div></div>'+chart(f.series);
   }else h+='<p class="help">No clear satellite image yet. Tap Update satellite data. Passes happen about every 5 days and cloudy ones are skipped.</p>';
+  h+=budgetHtml(f);
   h+='<h3>🌙 Almanac</h3><div id="alm" class="alm help">Loading sun, moon, frost dates and planting windows…</div>';
-  h+='<h3>Field settings</h3><p class="help" style="margin:0 0 4px">These make the irrigation advice fit your field.</p><div class="two"><div><label for="sc">Crop</label><input id="sc" maxlength="60" value="'+esc(f.crop)+'"></div><div><label for="ss">Soil</label><select id="ss"><option value="">Loam (default)</option><option value="sandy">Sandy (drains fast)</option><option value="loam">Loam</option><option value="clay">Clay (holds water)</option></select></div></div><label for="sm">Irrigation method</label><select id="sm"><option value="">Not sure</option><option value="drip">Drip</option><option value="sprinkler">Sprinkler or pivot</option><option value="flood">Flood or furrow</option></select><label for="sf">System flow (m&sup3; per hour, optional)</label><input id="sf" type="number" min="0" step="1" inputmode="decimal" value="'+(f.flow||"")+'"><button class="b alt sm" type="button" id="setSave">Save field settings</button>';
+  h+='<h3>Field settings</h3><p class="help" style="margin:0 0 4px">These make the irrigation advice fit your field.</p><div class="two"><div><label for="sc">Crop</label><input id="sc" maxlength="60" list="crops" value="'+esc(f.crop)+'"></div><div><label for="ss">Soil</label><select id="ss"><option value="">Loam (default)</option><option value="sandy">Sandy (drains fast)</option><option value="loam">Loam</option><option value="clay">Clay (holds water)</option></select></div></div><label for="sm">Irrigation method</label><select id="sm"><option value="">Not sure</option><option value="drip">Drip</option><option value="sprinkler">Sprinkler or pivot</option><option value="flood">Flood or furrow</option></select><label for="sf">System flow (m&sup3; per hour, optional)</label><input id="sf" type="number" min="0" step="1" inputmode="decimal" value="'+(f.flow||"")+'"><label for="sb">Season water allowance (mm, optional)</label><input id="sb" type="number" min="0" step="10" inputmode="decimal" value="'+(f.budgetMm||"")+'"><div class="two"><div><label for="sd">Season starts</label><input id="sd" type="date" value="'+esc(f.seasonStart||"")+'"></div><div><label for="se">Season ends</label><input id="se" type="date" value="'+esc(f.seasonEnd||"")+'"></div></div><button class="b alt sm" type="button" id="setSave">Save field settings</button>';
   var KL={irrigation:"Irrigated",spray:"Sprayed",scouting:"Scouted",other:"Other"},today=new Date().toISOString().slice(0,10);
   h+='<h3>What you did</h3><p class="help" style="margin:0 0 4px">Logging irrigation makes the advice smarter, and helps build your farm record.</p>'+
     '<div class="two"><div><label for="lk">Action</label><select id="lk"><option value="irrigation">Irrigated</option><option value="spray">Sprayed</option><option value="scouting">Scouted</option><option value="other">Other</option></select></div><div><label for="la">Amount (mm, if irrigated)</label><input id="la" type="number" step="1" min="0" inputmode="decimal"></div></div>'+
@@ -2321,7 +2476,7 @@ function show(i){
   var mc=$("mapOn");if(mc)mc.addEventListener("change",function(){if(!moist||!dmap)return;if(this.checked)moist.addTo(dmap);else dmap.removeLayer(moist)});
   $("ss").value=f.soil||"";$("sm").value=f.irrigation||"";
   $("setSave").addEventListener("click",async function(){
-    try{await api("POST","farmsettings",{farmId:f.id,crop:$("sc").value,soil:$("ss").value,method:$("sm").value,flow:$("sf").value});say("Field settings saved.");await load()}catch(e){say(e.message,1)}
+    try{await api("POST","farmsettings",{farmId:f.id,crop:$("sc").value,soil:$("ss").value,method:$("sm").value,flow:$("sf").value,budget:$("sb").value,start:$("sd").value,end:$("se").value});say("Field settings saved.");await load()}catch(e){say(e.message,1)}
   });
   Array.prototype.forEach.call(document.querySelectorAll("[data-zlog]"),function(b){b.addEventListener("click",async function(){
     try{await api("POST","addlog",{farmId:f.id,kind:"scouting",date:new Date().toISOString().slice(0,10),note:"Checked zone "+b.getAttribute("data-zlog")});say("Logged. Thanks for checking zone "+b.getAttribute("data-zlog")+".");await load()}catch(e){say(e.message,1)}
@@ -2350,6 +2505,7 @@ function render(){
       '<p style="margin:8px 0 0"><b>Total today: '+pl.totalM3+' m&sup3;'+(pl.totalHours!=null?', about '+pl.totalHours+' pump hours':'')+'</b></p>';
   }else ph+='<p style="margin:0">Nothing needs irrigating today.</p>';
   if(pl.soon.length)ph+='<p class="help" style="margin:8px 0 0">Coming up: '+pl.soon.map(function(i){return esc(i.name)+" ("+esc(i.headline)+")"}).join("; ")+'</p>';
+  var wb=DATA.waterBudget;if(wb&&wb.items.length){ph+='<h3 style="margin-top:14px">💧 Season water budget</h3>'+wb.items.map(function(i){return '<div class="logrow"><span><b>'+esc(i.name)+'</b>: '+i.usedPct+'% used &middot; '+esc(i.shortStatus)+'</span></div>'}).join("")+'<p class="help" style="margin:6px 0 0">All fields: '+wb.totalAppliedM3+' of '+wb.totalBudgetM3+' m&sup3; ('+wb.totalPct+'%)</p>'}
   $("planCard").innerHTML=ph;
   var c={Dry:0,Watch:0,Moist:0,"No data":0};farms.forEach(function(f){c[lab(f)]++});
   $("tiles").innerHTML=["Dry","Watch","Moist","No data"].map(function(k){return '<div class="tile"><b style="color:'+COL[k]+'">'+c[k]+'</b><span>'+k+'</span></div>'}).join("");
@@ -2366,7 +2522,7 @@ async function load(){
 async function enter(){
   var me=await api("GET","me");INVITE=!!me.inviteRequired;AI_ON=!!me.ai;
   if(!me.user){showAuth();return}
-  $("auth").hidden=true;$("app").hidden=false;$("who").hidden=false;$("whoName").textContent=me.user.name||me.user.email;
+  $("auth").hidden=true;$("app").hidden=false;$("who").hidden=false;$("delAcct").hidden=false;$("whoName").textContent=me.user.name||me.user.email;
   $("emailPref").checked=!!me.user.emailBriefing;
   await load();
 }
@@ -2591,6 +2747,66 @@ else enter().catch(function(e){say("Could not load Farm Watch. "+e.message,1)});
 
 # ---------- web handler ----------
 
+CONTACT_EMAIL = (os.environ.get("CONTACT_EMAIL") or "").strip()
+LEGAL_DATE = "October 29, 2026"
+LEGAL_CSS = ("body{margin:0;background:#f3f7f4;color:#0f2a20;font:16px/1.65 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}"
+             "@media(prefers-color-scheme:dark){body{background:#07130e;color:#e9f5ee}a{color:#7bd88f}}"
+             "main{max-width:720px;margin:0 auto;padding:28px 20px 60px}h1{font-size:30px;margin:6px 0 4px}h2{font-size:18px;margin:26px 0 6px}"
+             "p,li{color:inherit;opacity:.92}.d{opacity:.65;font-size:14px}a{color:#0f7b5c}.top{font-weight:800;text-decoration:none}")
+
+
+def legal_page(kind):
+    mail = ('<p>Questions or requests: <a href="mailto:%s">%s</a></p>' % (CONTACT_EMAIL, CONTACT_EMAIL)) if CONTACT_EMAIL else ""
+    if kind == "terms":
+        title = "Terms of Service"
+        body = """
+<h2>1. About Farm Watch</h2><p>Farm Watch is a farm monitoring service run by A1 AI. It combines satellite imagery, weather data and the information you enter to give irrigation, risk and planning guidance. By creating an account or using the service you agree to these terms.</p>
+<h2>2. Guidance only</h2><p>Everything Farm Watch shows, including irrigation amounts, risk flags, almanac dates and AI answers, is general guidance. It is not professional agronomic, legal, financial or safety advice. Satellites cannot see through clouds, models are estimates, and your field may differ. You are responsible for your own decisions. Always confirm spraying, pest and disease decisions with a qualified local agronomist and follow product labels and local law.</p>
+<h2>3. Your account</h2><p>Keep your password private and give us accurate details. You are responsible for activity on your account. You can delete your account at any time from the footer of the app.</p>
+<h2>4. Your data</h2><p>You keep ownership of the data you enter, including field boundaries, logs and worker records. You give us permission to store and process it only to run the service for you. If you record information about workers, you are responsible for having their consent and following the labor and privacy laws that apply to you. Farm Watch does not track anyone's location.</p>
+<h2>5. Acceptable use</h2><p>Do not misuse the service, attempt to break or overload it, access other people's data, or use it to break the law. We may suspend accounts that do.</p>
+<h2>6. Availability and changes</h2><p>We work to keep the service running but do not promise it will always be available or error-free. We may change or end features, and we will try to give notice of major changes.</p>
+<h2>7. Liability</h2><p>The service is provided "as is". To the extent the law allows, A1 AI is not liable for crop loss, water or input costs, or other indirect or consequential losses arising from use of the guidance. Nothing in these terms limits rights you have under law that cannot be limited.</p>
+<h2>8. Contact</h2><p>We may update these terms and will post the new date here.</p>"""
+    else:
+        title = "Privacy Policy"
+        body = """
+<h2>What we collect</h2><ul><li>Account details: your name, email and a hashed password.</li><li>Farm data you enter: field names, crops, boundaries, settings, activity logs and advice feedback.</li><li>Labor records if you use that feature: worker names, roles, pay rates and hours.</li><li>Advisor conversations: your questions and the answers. Photos are analysed to answer you and are not stored by us.</li></ul>
+<h2>How we use it</h2><p>Only to run Farm Watch for you: to fetch satellite and weather data for your fields, calculate advice, answer your questions and send emails you ask for, such as password resets. We do not sell your data and we do not show ads.</p>
+<h2>Who processes it for us</h2><ul><li>Hosting and database providers (Render and Neon) store the service and its data.</li><li>Copernicus Sentinel Hub receives your field boundaries to return satellite readings.</li><li>Open-Meteo receives field coordinates to return weather and climate data.</li><li>Our AI provider (Anthropic by default) receives your question, relevant field information and any photo you attach, to write an answer.</li><li>Map tile providers (Esri, OpenStreetMap) see map requests from your browser.</li><li>An email provider, if email is turned on.</li></ul>
+<h2>Cookies</h2><p>One essential sign-in cookie keeps you logged in. We do not use advertising or tracking cookies.</p>
+<h2>Retention and deletion</h2><p>We keep your data until you delete it. Use "Delete my account" in the footer of the app to permanently remove your account, farms, logs, labor records and conversations.</p>
+<h2>Security</h2><p>Passwords are hashed, connections are encrypted, and sign-in cookies are protected. No system is perfectly secure, so please use a strong, unique password.</p>
+<h2>Your rights</h2><p>Depending on where you live, you may have rights to access, correct or delete your data. Contact us and we will help.</p>
+<h2>Contact</h2><p>We may update this policy and will post the new date here.</p>"""
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>%s · Farm Watch</title><meta name="robots" content="index,follow"><style>%s</style></head><body><main>'
+            '<a class="top" href="./">← Farm Watch by A1 AI</a><h1>%s</h1><p class="d">Last updated %s</p>%s%s</main></body></html>'
+            % (title, LEGAL_CSS, title, LEGAL_DATE, body, mail)).encode("utf-8")
+
+
+APP_ICON = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+            b'<stop offset="0" stop-color="#06301f"/><stop offset="1" stop-color="#16a56f"/></linearGradient></defs>'
+            b'<rect width="512" height="512" rx="112" fill="url(#g)"/><text x="256" y="320" font-family="Arial,sans-serif" font-weight="800" '
+            b'font-size="210" text-anchor="middle" fill="#c9f7a1">A1</text></svg>')
+
+
+def config_warnings():
+    out = []
+    if not os.environ.get("SESSION_SECRET"):
+        out.append("SESSION_SECRET is not set. Set a long random value so sign-in cookies stay valid and secure.")
+    if not os.environ.get("INVITE_CODE"):
+        out.append("INVITE_CODE is not set, so anyone can create an account.")
+    if len(os.environ.get("ADMIN_TOKEN", "")) < 16:
+        out.append("ADMIN_TOKEN is missing or short. Use at least 16 random characters.")
+    if os.environ.get("AQAS_ADMIN_TOKEN") and len(os.environ["AQAS_ADMIN_TOKEN"]) < 16:
+        out.append("AQAS_ADMIN_TOKEN is short. Use at least 16 random characters.")
+    if not CONTACT_EMAIL:
+        out.append("CONTACT_EMAIL is not set, so the Terms and Privacy pages show no contact address.")
+    return out
+
+
+
 class handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json", extra=None):
         if not isinstance(body, bytes):
@@ -2600,6 +2816,10 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        self.send_header("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -2675,8 +2895,16 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         r = self._query().get("r", "")
         try:
-            if r in ("", "app"):
+            if r in ("", "app") and not urlparse(self.path).path.endswith("/robots.txt"):
                 return self._send(200, APP_HTML.encode("utf-8"), "text/html; charset=utf-8", {"Cache-Control": "no-cache"})
+            if urlparse(self.path).path.endswith("/robots.txt"):
+                return self._send(200, b"User-agent: *\nAllow: /\nDisallow: /?r=aqas\nDisallow: /api/\n", "text/plain; charset=utf-8", {"Cache-Control": "public, max-age=86400"})
+            if r in ("terms", "privacy"):
+                return self._send(200, legal_page(r), "text/html; charset=utf-8", {"Cache-Control": "public, max-age=3600"})
+            if r == "icon":
+                return self._send(200, APP_ICON, "image/svg+xml", {"Cache-Control": "public, max-age=604800"})
+            if r == "manifest":
+                return self._send(200, json.dumps({"name": "Farm Watch by A1 AI", "short_name": "Farm Watch", "start_url": "./", "display": "standalone", "background_color": "#06301f", "theme_color": "#0f7b5c", "description": "Satellite irrigation intelligence for your farm.", "icons": [{"src": "?r=icon", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}]}).encode(), "application/manifest+json", {"Cache-Control": "public, max-age=86400"})
             if r == "aqas":
                 return self._send(200, AQAS_HTML.encode("utf-8"), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
             if r == "health":
@@ -2853,8 +3081,15 @@ class handler(BaseHTTPRequestHandler):
                     raise ValueError("Missing log id.")
                 delete_log(user["id"], int(lid))
                 return self._json(200, {"deleted": True})
+            if r == "deleteaccount":
+                rows = sql("SELECT pw_hash FROM fw_users WHERE id=$1", (user["id"],))
+                if not rows or not check_pw(data.get("password") or "", rows[0]["pw_hash"]):
+                    raise ValueError("That password is not correct.")
+                sql("DELETE FROM fw_users WHERE id=$1", (user["id"],))
+                return self._json(200, {"ok": True}, self._session_cookie("", clear=True))
             if r == "farmsettings":
-                update_settings(user["id"], int(data.get("farmId") or 0), data.get("crop"), data.get("soil"), data.get("method"), data.get("flow"))
+                update_settings(user["id"], int(data.get("farmId") or 0), data.get("crop"), data.get("soil"), data.get("method"), data.get("flow"),
+                                data.get("budget", _UNSET), data.get("start", _UNSET), data.get("end", _UNSET))
                 return self._json(200, {"ok": True})
             if r == "feedback":
                 add_feedback(user["id"], int(data.get("farmId") or 0), data.get("verdict"), data.get("note"))
@@ -2906,5 +3141,7 @@ class handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     from http.server import ThreadingHTTPServer
     port = int(os.environ.get("PORT", "8000"))
+    for w in config_warnings():
+        print("WARNING:", w, flush=True)
     print(f"Farm Watch running on port {port}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), handler).serve_forever()
