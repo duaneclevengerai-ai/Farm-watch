@@ -1087,12 +1087,123 @@ def farm_view(f, readings, days, logs=(), feedback=(), zone_rows=(), now=None, m
             "soil": f.get("soil") or "", "irrigation": f.get("irrigation") or "", "flow": _f(f.get("flow_m3h")),
             "now": now, "budgetMm": _f(f.get("budget_mm")), "seasonStart": f.get("season_start") or "", "seasonEnd": f.get("season_end") or "",
             "budget": water_budget(f, irr_logs or [], date.today(), advice),
+            "score": farm_score(readings, zones, list(logs), water_budget(f, irr_logs or [], date.today(), advice)),
             "map": ({"date": map_meta["date"], "bbox": json.loads(map_meta["bbox"]),
                      "url": f"/api/index?r=map&id={int(f['id'])}&v={map_meta['date']}"} if map_meta else None),
             "geometry": json.loads(f["geometry"]), "series": readings, "status": status,
             "forecast": fut, "advice": advice, "zones": zones,
             "feedback": feedback[0] if feedback else None, "logs": list(logs)[:15],
             "risks": flags, "sprayDays": spray}
+
+
+def farm_score(readings, zones, logs, budget, today=None):
+    """Farm scorecard, 0 to 100. Every part is shown with its weight and the reason, so the number is never a mystery.
+    It summarises what the satellite, weather and the person's own records show. It is not an audit."""
+    today = today or date.today()
+    parts = []
+    rs = [r for r in (readings or [])[-6:] if r.get("ndmi") is not None]
+    if rs:
+        share = sum(1 for r in rs if status_of(r["ndmi"]) != "Dry") / len(rs)
+        s, txt = share * 100, "%d%% of recent satellite passes were not dry." % round(share * 100)
+        if budget and budget["status"] == "ahead":
+            s -= 10; txt += " Water use is ahead of your seasonal pace."
+        elif budget and budget["status"] == "over":
+            s -= 25; txt += " The seasonal allowance has been exceeded."
+        parts.append(("Water management", 35, max(0, s), txt, "Keep soil moisture out of the dry range and stay within your seasonal allowance."))
+    nv = [r["ndvi"] for r in (readings or []) if r.get("ndvi") is not None]
+    if len(nv) >= 3 and max(nv) > 0:
+        ratio = nv[-1] / max(nv)
+        parts.append(("Crop health", 25, max(0, min(100, (ratio - 0.5) / 0.5 * 100)),
+                      "Greenness is at %d%% of this field's own recent peak. Natural ripening also lowers it." % round(ratio * 100),
+                      "Scout the field. Greenness has dropped from its recent peak."))
+    flagged = [z for z in (zones or []) if z.get("flags")]
+    if zones:
+        parts.append(("Field uniformity", 15, 100 * (1 - len(flagged) / len(zones)),
+                      "%d of %d zones differ from the rest of the field." % (len(flagged), len(zones)),
+                      "Inspect the flagged zones. Uneven fields lose yield and water."))
+    cutoff = (today - timedelta(days=14)).isoformat()
+    n = sum(1 for lg in (logs or []) if (lg.get("date") or "") >= cutoff)
+    parts.append(("Record keeping", 15, min(100, n / 3 * 100), "%d activity entr%s in the last 14 days." % (n, "y" if n == 1 else "ies"),
+                  "Log irrigation, spraying and scouting. Records make the advice and your water budget more accurate."))
+    if readings:
+        try:
+            age = (today - date.fromisoformat(readings[-1]["date"])).days
+            parts.append(("Monitoring freshness", 10, max(0, min(100, (21 - age) / 14 * 100)),
+                          "The latest satellite reading is %d day%s old." % (age, "" if age == 1 else "s"),
+                          "Cloud has limited fresh readings. Check again after the next clear pass."))
+        except (KeyError, ValueError):
+            pass
+    if not parts:
+        return None
+    wsum = sum(w for _, w, _, _, _ in parts)
+    score = round(sum(w * s for _, w, s, _, _ in parts) / wsum)
+    low = min(parts, key=lambda x: x[2])
+    return {"score": score, "grade": "Excellent" if score >= 85 else "Good" if score >= 70 else "Fair" if score >= 50 else "Needs attention",
+            "components": [{"name": nm, "weight": round(w / wsum * 100), "score": round(s), "text": tx} for nm, w, s, tx, _ in parts],
+            "tip": low[4] if low[2] < 70 else "", "tipArea": low[0] if low[2] < 70 else ""}
+
+
+def accuracy_stats(verdicts):
+    """How often farmers said the advice matched their field. Only real answers are counted."""
+    v = list(verdicts or [])
+    total = len(v)
+    ok_n = sum(1 for x in v if x == "ok")
+    return {"total": total, "matched": ok_n, "pct": round(ok_n / total * 100) if total else None,
+            "wetter": sum(1 for x in v if x == "wetter"), "drier": sum(1 for x in v if x == "drier"), "smallSample": total < 10}
+
+
+import html as _html
+
+
+def report_html(user, payload, farm_id=None):
+    """A printable weekly report. People can print it or save it as a PDF from their browser."""
+    e = lambda x: _html.escape(str(x if x is not None else ""))
+    farms = [f for f in payload["farms"] if farm_id is None or f["id"] == farm_id]
+    today = date.today()
+    out = []
+    for f in farms:
+        a, sc, b = f["advice"], f.get("score"), f.get("budget")
+        s = '<section class="farm"><h2>%s</h2><p class="meta">%s · %s ha · satellite status: <b>%s</b></p>' % (
+            e(f["name"]), e(f["crop"] or "Crop not set"), e(round(f["areaHa"] or 0, 1)), e(f["status"] or "no reading yet"))
+        s += '<div class="box"><b>%s</b><br>%s</div>' % (e(a.get("headline")), e(a.get("detail")))
+        if sc:
+            s += '<h3>Farm scorecard: %d / 100 (%s)</h3>' % (sc["score"], e(sc["grade"]))
+            for c in sc["components"]:
+                s += '<div class="row"><span>%s <i>(%d%% of score)</i></span><span class="bar"><span style="width:%d%%"></span></span><span>%d</span></div><p class="why">%s</p>' % (
+                    e(c["name"]), c["weight"], c["score"], c["score"], e(c["text"]))
+            if sc.get("tip"):
+                s += '<p><b>Biggest opportunity:</b> %s</p>' % e(sc["tip"])
+        if b:
+            s += '<h3>Season water budget</h3><p>%s %s Used %d of %d mm.</p>' % (e(b["headline"]), e(b["detail"]), b["appliedMm"], b["budgetMm"])
+        if f.get("risks"):
+            s += '<h3>Watch list</h3><ul>' + "".join('<li><b>%s</b>: %s</li>' % (e(r["kind"]), e(r["text"])) for r in f["risks"][:6]) + '</ul>'
+        if f.get("forecast"):
+            s += '<h3>Next 7 days</h3><table><tr><th>Date</th><th>High</th><th>Low</th><th>Rain mm</th><th>ET mm</th></tr>' + "".join(
+                '<tr><td>%s</td><td>%s°</td><td>%s°</td><td>%s</td><td>%s</td></tr>' % (e(d.get("date")), e(d.get("tmax")), e(d.get("tmin")), e(d.get("rain")), e(d.get("et0")))
+                for d in f["forecast"]) + '</table>'
+        wk = (today - timedelta(days=7)).isoformat()
+        recent = [lg for lg in f.get("logs", []) if (lg.get("date") or "") >= wk]
+        s += '<h3>Activity this week</h3>' + ('<ul>' + "".join('<li>%s · %s%s%s</li>' % (e(lg["date"]), e(lg["kind"]), (" · %s mm" % e(lg["amount"])) if lg.get("amount") else "", (" · " + e(lg["note"])) if lg.get("note") else "") for lg in recent) + '</ul>' if recent else '<p class="why">No activity logged this week.</p>')
+        out.append(s + '</section>')
+    plan = payload.get("plan") or {}
+    head = ""
+    if plan.get("today"):
+        head = '<div class="box"><b>Irrigation today:</b> ' + "; ".join('%s about %s mm (%s m³%s)' % (e(i["name"]), e(i["mm"]), e(i["m3"]), (", %s pump h" % e(i["hours"])) if i.get("hours") else "") for i in plan["today"]) + '</div>'
+    acc = payload.get("accuracy") or {}
+    accl = ('<p class="why">Farmers said our advice matched their field %d%% of the time (%d answers%s).</p>' % (acc["pct"], acc["total"], ", small sample" if acc.get("smallSample") else "")) if acc.get("total") else ""
+    css = ("body{font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#0f2a20;margin:0;background:#fff}main{max-width:820px;margin:0 auto;padding:24px 20px 50px}"
+           "header{background:linear-gradient(120deg,#06301f,#0f7b5c);color:#fff;padding:22px 20px;border-radius:0 0 18px 18px}header h1{margin:0;font-size:24px}header p{margin:4px 0 0;opacity:.85}"
+           "h2{font-size:21px;margin:26px 0 2px}h3{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#0f7b5c;margin:18px 0 6px}.meta{margin:0 0 10px;color:#53695e}"
+           ".box{background:#eef7f2;border-left:5px solid #0f7b5c;border-radius:10px;padding:10px 14px;margin:8px 0}.row{display:flex;align-items:center;gap:10px;justify-content:space-between}"
+           ".bar{flex:1;height:10px;background:#dbe7e0;border-radius:9px;overflow:hidden;max-width:260px}.bar span{display:block;height:100%;background:#0f7b5c}.why{margin:2px 0 8px;color:#53695e;font-size:13px}"
+           "table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid #dbe7e0;padding:5px 6px;text-align:left}.farm{page-break-inside:avoid}"
+           "button{font:inherit;font-weight:700;background:#0f7b5c;color:#fff;border:0;border-radius:10px;padding:10px 18px;margin:14px 0}.foot{margin-top:30px;font-size:12px;color:#53695e}"
+           "@media print{button{display:none}header{border-radius:0}}")
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Weekly field report · Farm Watch</title><style>%s</style></head><body><header><h1>Farm Watch by A1 AI</h1><p>Weekly field report · %s · prepared for %s</p></header><main>'
+            '<button onclick="window.print()">Print or save as PDF</button>%s%s%s<p class="foot">Guidance only, based on satellite imagery, weather data and the records you keep. '
+            'It is not a substitute for a local agronomist. Contains modified Copernicus Sentinel data. Weather data by Open-Meteo.com.</p></main></body></html>'
+            % (css, today.strftime("%B %d, %Y").replace(" 0", " "), e(user.get("name") or user["email"]), head, "".join(out) or "<p>No farms yet.</p>", accl)).encode("utf-8")
 
 
 def build_plan(views):
@@ -1182,7 +1293,8 @@ def farms_payload(user_id):
     views = [farm_view(f, by.get(int(f["id"]), []), w[0], logs_by.get(int(f["id"]), []), fb_by.get(int(f["id"]), []),
                        zr_by.get(int(f["id"]), []), w[1], maps.get(int(f["id"])), irr_by.get(int(f["id"]), []))
              for f, w in zip(farms, weather)]
-    return {"farms": views, "briefing": build_briefing(views), "plan": build_plan(views), "waterBudget": build_budget(views),
+    acc = accuracy_stats([x["verdict"] for x in sql("SELECT verdict FROM fw_feedback WHERE farm_id IN (SELECT id FROM fw_farms WHERE user_id=$1)", (user_id,))])
+    return {"farms": views, "accuracy": acc, "briefing": build_briefing(views), "plan": build_plan(views), "waterBudget": build_budget(views),
             "thresholds": {"watch": NDMI_WATCH, "dry": NDMI_DRY}, "lastFetch": get_meta("last_fetch")}
 
 
@@ -1443,7 +1555,7 @@ def run_daily():
             try:
                 p = farms_payload(int(u["id"]))
                 if p["farms"]:
-                    send_mail(u["email"], "Your Farm Watch morning briefing", briefing_text(u["name"], p["briefing"]))
+                    send_mail(u["email"], "Your Farm Watch morning briefing", briefing_text(u["name"], p["briefing"], p.get("plan"), p.get("waterBudget"), (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")))
                     sent += 1
             except Exception as e:
                 print("Briefing email failed:", e, file=sys.stderr)
@@ -1471,10 +1583,19 @@ def send_mail(to, subject, body):
     return True
 
 
-def briefing_text(name, b):
+def briefing_text(name, b, plan=None, budget=None, link=""):
     lines = [f"Good morning{' ' + name if name else ''}.", "", b["headline"], ""]
+    if plan and plan.get("today"):
+        lines += ["IRRIGATE TODAY"]
+        for i in plan["today"]:
+            lines.append("- %s: about %s mm (%s m3%s)" % (i["name"], i["mm"], i["m3"], (", %s pump hours" % i["hours"]) if i.get("hours") else ""))
+        lines.append("Total: %s m3%s" % (plan["totalM3"], (", %s pump hours" % plan["totalHours"]) if plan.get("totalHours") else ""))
+        lines.append("")
+    flagged = [i for i in (budget or {}).get("items", []) if i["status"] in ("ahead", "over")]
+    if flagged:
+        lines += ["WATER BUDGET"] + ["- %s: %s (%s%% used)" % (i["name"], i["shortStatus"], i["usedPct"]) for i in flagged] + [""]
     lines += ["- " + i["text"] for i in b["items"]]
-    lines += ["", "Open Farm Watch for the full forecast, irrigation advice and trends."]
+    lines += ["", "Open Farm Watch for the full forecast, irrigation advice and trends." + ((" " + link) if link else "")]
     return "\n".join(lines)
 
 
@@ -2104,6 +2225,7 @@ def aqas_health():
          "note": "no clear image in 14 days"},
         {"label": "Advisor questions today", "value": n("SELECT COUNT(*) AS n FROM fw_chats WHERE created >= $1", (today.isoformat(),)),
          "note": "AI provider: " + (ai_provider() or "not set")},
+        {"label": "Advice accuracy", "value": (lambda a: ("%d%%" % a["pct"]) if a["total"] else "no answers yet")(accuracy_stats([x["verdict"] for x in sql("SELECT verdict FROM fw_feedback")])), "note": "farmers who said the advice matched their field"},
         {"label": "Workers on the clock", "value": n("SELECT COUNT(*) AS n FROM fw_labor WHERE end_ts IS NULL"), "note": "labor tracking"},
         {"label": "Email", "value": "on" if os.environ.get("SMTP_HOST") else "off", "note": "briefings, alerts and password resets"},
     ]
@@ -2243,6 +2365,11 @@ input:not([type=checkbox]),select,textarea{border-radius:12px;background:var(--p
 input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0 3px rgba(15,123,92,.18);outline:0}
 .msg.ai{border-radius:16px;box-shadow:var(--sh);border-color:transparent}.msg.me{background:linear-gradient(135deg,var(--g2),#16a56f);color:#fff;border-radius:16px}
 .wrap{padding-bottom:max(36px,env(safe-area-inset-bottom))}
+#map{height:min(58vh,480px);border-radius:16px;box-shadow:var(--sh)}#ovmap{height:min(42vh,320px);border-radius:14px;margin-top:8px}
+.vx span{display:grid;place-items:center;width:26px;height:26px;border-radius:50%;background:#2fd08a;color:#06301f;font-weight:800;font-size:12px;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.45)}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--mute);margin-top:8px}.legend i{display:inline-block;width:12px;height:12px;border-radius:4px;margin-right:5px;vertical-align:-1px}
+.steps4{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:6px 0 10px}.steps4 div{background:rgba(15,123,92,.09);border-radius:12px;padding:8px 10px;font-size:13px}.steps4 b{display:block;color:var(--wet)}
+.chart{touch-action:pan-y}
 </style>
 </head>
 <body>
@@ -2279,11 +2406,13 @@ input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0
       <datalist id="crops"><option value="Almonds"><option value="Pistachios"><option value="Walnuts"><option value="Pecans"><option value="Hazelnuts"><option value="Macadamia"><option value="Cashews"><option value="Corn (maize)"><option value="Cotton"><option value="Wheat"><option value="Barley"><option value="Oats"><option value="Rye"><option value="Rice"><option value="Soybeans"><option value="Peanuts"><option value="Sorghum"><option value="Canola"><option value="Sunflower"><option value="Sugar beet"><option value="Sugarcane"><option value="Alfalfa"><option value="Tobacco"><option value="Hemp"><option value="Hops"><option value="Dry beans"><option value="Chickpeas"><option value="Lentils"><option value="Peas"><option value="Potatoes"><option value="Sweet potatoes"><option value="Tomatoes"><option value="Peppers"><option value="Onions"><option value="Garlic"><option value="Carrots"><option value="Lettuce"><option value="Cabbage"><option value="Broccoli"><option value="Pumpkin"><option value="Watermelon"><option value="Melons"><option value="Grapes (vineyard)"><option value="Olives"><option value="Citrus (orange, lemon)"><option value="Grapefruit"><option value="Apples"><option value="Pears"><option value="Peaches"><option value="Cherries"><option value="Plums"><option value="Apricots"><option value="Avocados"><option value="Mangoes"><option value="Bananas"><option value="Coffee"><option value="Cocoa"><option value="Tea"><option value="Dates"><option value="Pomegranates"><option value="Figs"><option value="Blueberries"><option value="Strawberries"></datalist><label for="fc">Crop</label><input id="fc" maxlength="60" list="crops" placeholder="Start typing: almonds, cotton, wheat…" autocomplete="off">
       <label for="q">Find the farm on the map</label>
       <div class="bar"><input id="q" placeholder="Village, town or address" aria-label="Search for a place"><button id="go" class="b alt" type="button">Search</button><button id="loc" class="b alt" type="button">My location</button></div>
+      <div id="results" class="bar"></div>
       <div id="map" aria-label="Map for drawing the farm boundary"></div>
-      <p class="help">Tap each corner of the field in order. Switch to Satellite view (top right of the map) to see field boundaries.</p>
+      <div class="steps4"><div><b>1 · Find it</b>Search a place or tap My location</div><div><b>2 · Outline it</b>Tap each corner. Drag a numbered corner to adjust</div><div><b>3 · Name it</b>Add a name and pick the crop above</div><div><b>4 · Save</b>Tap Save farm</div></div><p class="help" style="margin:0 0 6px">Already have a boundary file? <button id="impBtn" class="b alt sm" type="button">Import .geojson or .kml</button><input id="imp" type="file" accept=".geojson,.json,.kml" hidden></p>
       <p id="area" class="help"></p>
       <button id="undo" class="b alt" type="button">Undo last corner</button><button id="clear" class="b alt" type="button">Clear</button><button id="save" class="b" type="button">Save farm</button>
     </div>
+    <div class="panel" id="ovPanel" hidden><h2>All your fields</h2><div id="ovmap" aria-label="Map of all fields"></div><div class="legend"><span><i style="background:#e0533c"></i>Dry</span><span><i style="background:#f0a21b"></i>Watch</span><span><i style="background:#2f9bd8"></i>Moist</span><span><i style="background:#8a9a92"></i>No reading yet</span><span>Tap a field to open it</span></div></div>
     <div class="grid">
       <nav class="panel list" id="list" aria-label="Farms"></nav>
       <section class="panel" id="detail" aria-live="polite"></section>
@@ -2335,7 +2464,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0
 </div>
 <footer class="foot"><p>By using Farm Watch you agree to the <a href="?r=terms">Terms</a> and <a href="?r=privacy">Privacy Policy</a>. Guidance only, not a substitute for a local agronomist.</p><div id="payCard" class="panel" hidden style="margin:0 0 14px"></div><p><button id="delAcct" type="button" class="b alt" hidden>Delete my account</button></p><p class="d">© 2026 A1 AI</p></footer>
 <style>.foot{max-width:760px;margin:10px auto 40px;padding:0 18px;font-size:13px;color:var(--mute)}.foot a{color:var(--wet);font-weight:600}.foot .d{opacity:.7}</style>
-<script>window.fwPay=function(show){var c=document.getElementById("payCard");if(show===false){c.hidden=true;return}fetch("?r=me").then(function(r){return r.json()}).then(function(d){var u=d.user,p=d.pay||{};if(!u||(!p.stripe&&!p.paypal)){c.hidden=true;return}var L={trial:"Free pilot",active:"Active subscription",past_due:"Payment issue",cancelled:"Cancelled",free:"Free"};var h="<h2>Your plan: "+(L[u.plan]||"Free pilot")+"</h2>";if(u.plan!=="active"&&u.plan!=="free"){h+="<p class=\"help\" style=\"margin:0 0 10px\">Subscribe to keep Farm Watch running for your fields.</p>";if(p.stripe)h+="<a class=\"b\" style=\"display:block;text-align:center;text-decoration:none;margin-bottom:8px\" href=\""+p.stripe+"\" target=\"_blank\" rel=\"noopener\">Pay by card or Apple Pay</a>";if(p.paypal)h+="<a class=\"b alt\" style=\"display:block;text-align:center;text-decoration:none\" href=\""+p.paypal+"\" target=\"_blank\" rel=\"noopener\">Pay with PayPal</a><p class=\"help\" style=\"margin:8px 0 0\">PayPal payments are confirmed by our team, usually within a day.</p>"}else h+="<p class=\"help\" style=\"margin:0\">Thank you for being a customer.</p>";c.innerHTML=h;c.hidden=false}).catch(function(){c.hidden=true})};
+<script>window.fwTip=function(e,svg){try{var s=JSON.parse(svg.getAttribute("data-s")),th=svg.getAttribute("data-th").split(","),p=+svg.getAttribute("data-p"),W=+svg.getAttribute("data-w"),r=svg.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W,i=Math.max(0,Math.min(s.length-1,Math.round((x-p)/(W-2*p)*(s.length-1)))),a=s[i],px=p+i*(W-2*p)/Math.max(1,s.length-1),st=a[1]<+th[0]?"Dry":a[1]<+th[1]?"Watch":"Moist",l=svg.querySelector(".cl");l.setAttribute("x1",px);l.setAttribute("x2",px);l.setAttribute("opacity",".5");svg.querySelector(".tt").textContent=a[0]+": moisture "+a[1].toFixed(2)+" ("+st+")"+(a[2]!=null?", greenness "+a[2].toFixed(2):"")}catch(_){}};
+window.fwPay=function(show){var c=document.getElementById("payCard");if(show===false){c.hidden=true;return}fetch("?r=me").then(function(r){return r.json()}).then(function(d){var u=d.user,p=d.pay||{};if(!u||(!p.stripe&&!p.paypal)){c.hidden=true;return}var L={trial:"Free pilot",active:"Active subscription",past_due:"Payment issue",cancelled:"Cancelled",free:"Free"};var h="<h2>Your plan: "+(L[u.plan]||"Free pilot")+"</h2>";if(u.plan!=="active"&&u.plan!=="free"){h+="<p class=\"help\" style=\"margin:0 0 10px\">Subscribe to keep Farm Watch running for your fields.</p>";if(p.stripe)h+="<a class=\"b\" style=\"display:block;text-align:center;text-decoration:none;margin-bottom:8px\" href=\""+p.stripe+"\" target=\"_blank\" rel=\"noopener\">Pay by card or Apple Pay</a>";if(p.paypal)h+="<a class=\"b alt\" style=\"display:block;text-align:center;text-decoration:none\" href=\""+p.paypal+"\" target=\"_blank\" rel=\"noopener\">Pay with PayPal</a><p class=\"help\" style=\"margin:8px 0 0\">PayPal payments are confirmed by our team, usually within a day.</p>"}else h+="<p class=\"help\" style=\"margin:0\">Thank you for being a customer.</p>";c.innerHTML=h;c.hidden=false}).catch(function(){c.hidden=true})};
 document.getElementById("delAcct").addEventListener("click",function(){var pw=prompt("This permanently deletes your account, farms, logs and labor records. It cannot be undone.\n\nType your password to confirm:");if(!pw)return;fetch("?r=deleteaccount",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||"Could not delete.");alert("Your account has been deleted.");location.reload()})}).catch(function(e){alert(e.message)})});</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -2400,12 +2530,20 @@ $("logout").addEventListener("click",async function(){try{await api("POST","logo
 
 /* ---------- dashboard ---------- */
 function chart(s){
-  var W=640,H=200,p=30,v=s.map(function(x){return x.ndmi}),lo=Math.min.apply(null,[-0.05].concat(v))-0.02,hi=Math.max.apply(null,[0.4].concat(v))+0.02;
-  var X=function(i){return p+i*(W-2*p)/Math.max(1,s.length-1)},Y=function(y){return H-p-(y-lo)/(hi-lo)*(H-2*p)};
+  var W=640,H=220,p=34,v=s.map(function(x){return x.ndmi}),lo=Math.min.apply(null,[-0.05].concat(v))-0.02,hi=Math.max.apply(null,[0.4].concat(v))+0.02;
+  var X=function(i){return p+i*(W-2*p)/Math.max(1,s.length-1)},Y=function(y){return H-p-(y-lo)/(hi-lo)*(H-2*p)},Yg=function(y){return H-p-Math.max(0,Math.min(1,y))*(H-2*p)};
   var band=function(a,b,c){var y1=Y(Math.min(b,hi)),y2=Y(Math.max(a,lo));return '<rect x="'+p+'" y="'+y1+'" width="'+(W-2*p)+'" height="'+Math.max(0,y2-y1)+'" fill="'+c+'" opacity=".13"/>'};
   var line=s.map(function(x,i){return (i?"L":"M")+X(i)+" "+Y(x.ndmi)}).join(" ");
-  var d=s.map(function(x,i){return '<circle cx="'+X(i)+'" cy="'+Y(x.ndmi)+'" r="3.5" fill="var(--wet)"><title>'+x.date+": NDMI "+x.ndmi.toFixed(2)+'</title></circle>'}).join("");
-  return '<svg class="chart" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Moisture index over time">'+band(lo,TH.dry,"var(--dry)")+band(TH.dry,TH.watch,"var(--watch)")+band(TH.watch,hi,"var(--ok)")+'<path d="'+line+'" fill="none" stroke="var(--wet)" stroke-width="2.5"/>'+d+'<text x="'+p+'" y="'+(H-8)+'" font-size="12" fill="var(--mute)">'+s[0].date+'</text><text x="'+(W-p)+'" y="'+(H-8)+'" font-size="12" fill="var(--mute)" text-anchor="end">'+s[s.length-1].date+'</text></svg>';
+  var gl="",gs=false;s.forEach(function(x,i){if(x.ndvi==null){gs=false;return}gl+=(gs?"L":"M")+X(i)+" "+Yg(x.ndvi)+" ";gs=true});
+  var d=s.map(function(x,i){return '<circle cx="'+X(i)+'" cy="'+Y(x.ndmi)+'" r="'+(i===s.length-1?5:3)+'" fill="var(--wet)" stroke="#fff" stroke-width="'+(i===s.length-1?2:0)+'"/>'}).join("");
+  var data=esc(JSON.stringify(s.map(function(x){return [x.date,x.ndmi,x.ndvi]}))),L0=s[s.length-1];
+  return '<svg class="chart" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Moisture and greenness over time. Tap or drag to read any day." data-s="'+data+'" data-th="'+TH.dry+','+TH.watch+'" data-p="'+p+'" data-w="'+W+'" onpointermove="fwTip(event,this)" onpointerdown="fwTip(event,this)">'+
+    band(lo,TH.dry,"var(--dry)")+band(TH.dry,TH.watch,"var(--watch)")+band(TH.watch,hi,"var(--ok)")+
+    '<path d="'+gl+'" fill="none" stroke="#7bb661" stroke-width="2" stroke-dasharray="5 4"/><path d="'+line+'" fill="none" stroke="var(--wet)" stroke-width="2.5"/>'+d+
+    '<line class="cl" x1="0" x2="0" y1="'+p+'" y2="'+(H-p)+'" stroke="var(--ink)" stroke-width="1" opacity="0"/>'+
+    '<text class="tt" x="'+p+'" y="16" font-size="13" font-weight="700" fill="var(--ink)">Latest · '+L0.date+': moisture '+L0.ndmi.toFixed(2)+(L0.ndvi!=null?', greenness '+L0.ndvi.toFixed(2):'')+'</text>'+
+    '<text x="'+p+'" y="'+(H-8)+'" font-size="12" fill="var(--mute)">'+s[0].date+'</text><text x="'+(W-p)+'" y="'+(H-8)+'" font-size="12" fill="var(--mute)" text-anchor="end">'+L0.date+'</text>'+
+    '<text x="'+(W/2)+'" y="'+(H-8)+'" font-size="12" fill="var(--mute)" text-anchor="middle"><tspan fill="var(--wet)">━ moisture</tspan>  <tspan fill="#7bb661">╌ greenness</tspan></text></svg>';
 }
 var moist=null;
 function drawDetailMap(f){
@@ -2439,6 +2577,8 @@ function budgetHtml(f){var b=f.budget;
   if(!b)return '<h3>💧 Water budget</h3><p class="help" style="margin:0">Set a season water allowance in Field settings below to track how much you have used and whether you are on pace.</p>';
   var col=b.status==="over"?"#e0533c":b.status==="ahead"?"#f0a21b":"var(--ok)",w=Math.min(100,b.usedPct),t=Math.min(100,b.timePct);
   return '<h3>💧 Water budget</h3><div class="adv" style="border-left-color:'+col+'"><b>'+esc(b.headline)+'</b><div style="position:relative;height:12px;border-radius:99px;background:var(--line);margin:12px 0 6px;overflow:hidden"><div style="width:'+w+'%;height:100%;background:'+col+'"></div><div style="position:absolute;left:'+t+'%;top:0;bottom:0;width:2px;background:var(--ink);opacity:.6"></div></div><div class="help" style="margin:0">Used '+b.appliedMm+' of '+b.budgetMm+' mm ('+b.appliedM3+' of '+b.budgetM3+' m&sup3;). The line shows how much of the season has passed.</div>'+(b.detail?'<p style="margin:8px 0 0">'+esc(b.detail)+'</p>':'')+'<p class="help" style="margin:6px 0 0">Counts only the irrigation you log.'+(b.unlogged?' '+b.unlogged+' entries have no amount and are not counted.':'')+'</p></div>';}
+function scoreHtml(f){var s=f.score;if(!s)return "";var col=s.score>=85?"var(--ok)":s.score>=70?"#7bb661":s.score>=50?"#f0a21b":"#e0533c";
+  return '<h3>⭐ Farm scorecard</h3><div class="adv" style="border-left-color:'+col+'"><div style="display:flex;align-items:center;gap:14px"><div style="font-size:40px;font-weight:850;color:'+col+';line-height:1">'+s.score+'</div><div><b>'+esc(s.grade)+'</b><div class="help" style="margin:0">out of 100 · '+s.components.length+' factors</div></div></div>'+s.components.map(function(c){return '<div style="margin-top:10px"><div style="display:flex;justify-content:space-between;font-size:13px"><span><b>'+esc(c.name)+'</b> <i class="help">('+c.weight+'% of score)</i></span><b>'+c.score+'</b></div><div style="height:8px;border-radius:9px;background:var(--line);overflow:hidden;margin:3px 0"><div style="width:'+c.score+'%;height:100%;background:'+col+'"></div></div><div class="help" style="margin:0">'+esc(c.text)+'</div></div>'}).join("")+(s.tip?'<p style="margin:12px 0 0"><b>Biggest opportunity:</b> '+esc(s.tip)+'</p>':'')+'<p style="margin:10px 0 0"><a class="b alt sm" style="text-decoration:none" href="?r=report&id='+f.id+'" target="_blank" rel="noopener">📄 Weekly report</a></p></div>';}
 function show(i){
   var f=DATA.farms[i];sel=f.id;armed=null;
   Array.prototype.forEach.call(document.querySelectorAll("#list button"),function(b){b.setAttribute("aria-current",b.getAttribute("data-id")==String(f.id))});
@@ -2473,6 +2613,7 @@ function show(i){
     var prev=f.series.length>1?f.series[f.series.length-2]:l,d=l.ndmi-prev.ndmi;
     h+='<h3>Satellite readings</h3><div class="stats"><div><b>'+l.ndmi.toFixed(2)+'</b><span>Moisture index (NDMI)</span></div><div><b>'+(d>0?"+":"")+d.toFixed(2)+'</b><span>Since previous pass</span></div><div><b>'+(l.ndvi==null?"n/a":l.ndvi.toFixed(2))+'</b><span>Greenness (NDVI)</span></div><div><b>'+esc(ago(l.date))+'</b><span>Latest clear image</span></div></div>'+chart(f.series);
   }else h+='<p class="help">No clear satellite image yet. Tap Update satellite data. Passes happen about every 5 days and cloudy ones are skipped.</p>';
+  h+=scoreHtml(f);
   h+=budgetHtml(f);
   h+='<h3>🌙 Almanac</h3><div id="alm" class="alm help">Loading sun, moon, frost dates and planting windows…</div>';
   h+='<h3>Field settings</h3><p class="help" style="margin:0 0 4px">These make the irrigation advice fit your field.</p><div class="two"><div><label for="sc">Crop</label><input id="sc" maxlength="60" list="crops" value="'+esc(f.crop)+'"></div><div><label for="ss">Soil</label><select id="ss"><option value="">Loam (default)</option><option value="sandy">Sandy (drains fast)</option><option value="loam">Loam</option><option value="clay">Clay (holds water)</option></select></div></div><label for="sm">Irrigation method</label><select id="sm"><option value="">Not sure</option><option value="drip">Drip</option><option value="sprinkler">Sprinkler or pivot</option><option value="flood">Flood or furrow</option></select><label for="sf">System flow (m&sup3; per hour, optional)</label><input id="sf" type="number" min="0" step="1" inputmode="decimal" value="'+(f.flow||"")+'"><label for="sb">Season water allowance (mm, optional)</label><input id="sb" type="number" min="0" step="10" inputmode="decimal" value="'+(f.budgetMm||"")+'"><div class="two"><div><label for="sd">Season starts</label><input id="sd" type="date" value="'+esc(f.seasonStart||"")+'"></div><div><label for="se">Season ends</label><input id="se" type="date" value="'+esc(f.seasonEnd||"")+'"></div></div><button class="b alt sm" type="button" id="setSave">Save field settings</button>';
@@ -2517,6 +2658,8 @@ function render(){
   }else ph+='<p style="margin:0">Nothing needs irrigating today.</p>';
   if(pl.soon.length)ph+='<p class="help" style="margin:8px 0 0">Coming up: '+pl.soon.map(function(i){return esc(i.name)+" ("+esc(i.headline)+")"}).join("; ")+'</p>';
   var wb=DATA.waterBudget;if(wb&&wb.items.length){ph+='<h3 style="margin-top:14px">💧 Season water budget</h3>'+wb.items.map(function(i){return '<div class="logrow"><span><b>'+esc(i.name)+'</b>: '+i.usedPct+'% used &middot; '+esc(i.shortStatus)+'</span></div>'}).join("")+'<p class="help" style="margin:6px 0 0">All fields: '+wb.totalAppliedM3+' of '+wb.totalBudgetM3+' m&sup3; ('+wb.totalPct+'%)</p>'}
+  if(DATA.accuracy&&DATA.accuracy.total){var ac=DATA.accuracy;ph+='<p class="help" style="margin:10px 0 0">Advice accuracy: '+ac.pct+'% matched your fields ('+ac.total+' answer'+(ac.total===1?"":"s")+(ac.smallSample?", small sample":"")+')</p>'}
+  if(DATA.farms&&DATA.farms.length){ph+='<p style="margin:12px 0 0"><a class="b alt sm" style="text-decoration:none" href="?r=report&id=all" target="_blank" rel="noopener">📄 Weekly report for all fields</a></p>'}
   $("planCard").innerHTML=ph;
   var c={Dry:0,Watch:0,Moist:0,"No data":0};farms.forEach(function(f){c[lab(f)]++});
   $("tiles").innerHTML=["Dry","Watch","Moist","No data"].map(function(k){return '<div class="tile"><b style="color:'+COL[k]+'">'+c[k]+'</b><span>'+k+'</span></div>'}).join("");
@@ -2527,8 +2670,19 @@ function render(){
   if(!farms.length){$("detail").innerHTML='<h2>Welcome to Farm Watch</h2><p class="help" style="margin:0 0 6px">You will have your first advice in about two minutes:</p><ol class="steps"><li>Tap <b>Add a farm</b>, search for your village or town, switch the map to Satellite, and tap the corners of a field.</li><li>Tap <b>Save farm</b>. The 7-day forecast and irrigation advice appear straight away.</li><li>Tap <b>Update satellite data</b> to load the latest Sentinel-2 moisture readings. This can take up to a minute.</li><li>Come back each morning for your briefing, and log what you irrigate or spray.</li></ol>';return}
   var idx=ORDER[0];farms.forEach(function(f,i){if(f.id===sel)idx=i});show(idx);
 }
+var omap=null,olayer=null;
+function drawOverview(){
+  var fs=DATA.farms||[],pn=$("ovPanel");if(!pn)return;
+  pn.hidden=!fs.length;if(!fs.length||typeof L==="undefined")return;
+  if(!omap){omap=L.map("ovmap",{scrollWheelZoom:false});L.tileLayer(SAT,{maxZoom:19,attribution:"Tiles &copy; Esri"}).addTo(omap)}
+  if(olayer)omap.removeLayer(olayer);olayer=L.featureGroup().addTo(omap);
+  fs.forEach(function(f,i){if(!f.geometry)return;var ring=f.geometry.coordinates[0].map(function(p){return [p[1],p[0]]}),st=f.status||"none";
+    var col=st==="Dry"?"#e0533c":st==="Watch"?"#f0a21b":st==="Moist"?"#2f9bd8":"#8a9a92";
+    L.polygon(ring,{color:col,weight:3,fillColor:col,fillOpacity:.38}).bindTooltip(f.name+" · "+(f.status||"no reading yet")+(f.crop?" · "+f.crop:""),{sticky:true}).on("click",function(){show(i);var d=$("detail");if(d)d.scrollIntoView({behavior:"smooth",block:"start"})}).addTo(olayer)});
+  setTimeout(function(){omap.invalidateSize();omap.fitBounds(olayer.getBounds(),{padding:[24,24],maxZoom:17})},60);
+}
 async function load(){
-  DATA=await api("GET","farms");render();if(typeof fillFarmSelects==="function")fillFarmSelects();
+  DATA=await api("GET","farms");render();try{drawOverview()}catch(e){}if(typeof fillFarmSelects==="function")fillFarmSelects();
 }
 async function enter(){
   var me=await api("GET","me");INVITE=!!me.inviteRequired;AI_ON=!!me.ai;
@@ -2545,44 +2699,95 @@ $("fetch").addEventListener("click",async function(){
   b.disabled=false;
 });
 
-/* ---------- add a farm: tap corners on the map ---------- */
+/* ---------- add a farm: outline it on the map ---------- */
 function areaHa(p){if(p.length<3)return 0;var lat0=p.reduce(function(a,q){return a+q[0]},0)/p.length,kx=111320*Math.cos(lat0*Math.PI/180),ky=110540,xy=p.map(function(q){return [q[1]*kx,q[0]*ky]}),t=0;for(var i=0;i<xy.length;i++){var a=xy[i],b=xy[(i+1)%xy.length];t+=a[0]*b[1]-b[0]*a[1]}return Math.abs(t)/2/10000}
+function segX(a,b,c,d){function o(p,q,r){return (q[1]-p[1])*(r[0]-q[0])-(q[0]-p[0])*(r[1]-q[1])}return o(a,b,c)*o(a,b,d)<0&&o(c,d,a)*o(c,d,b)<0}
+function crosses(p){var n=p.length;if(n<4)return false;for(var i=0;i<n;i++)for(var j=i+2;j<n;j++){if(i===0&&j===n-1)continue;if(segX(p[i],p[(i+1)%n],p[j],p[(j+1)%n]))return true}return false}
+function fmtArea(h){return h.toFixed(1)+" ha ("+(h*2.47105).toFixed(1)+" acres)"}
+function liveInfo(){var n=pts.length,a=areaHa(pts),m;
+  if(n<3)m=n===0?"Tap the corners of your field, one by one around the edge.":n+" corner"+(n===1?"":"s")+" so far. Add "+(3-n)+" more.";
+  else if(crosses(pts))m="⚠️ The edges cross each other. Drag a corner or tap Undo so the outline does not twist.";
+  else m="✅ "+n+" corners · "+fmtArea(a)+(a<0.05?" · very small":a>3000?" · very large, please check":"")+". Drag any numbered corner to adjust.";
+  $("area").textContent=m}
 function redraw(){
   if(!amap)return;
   if(poly){amap.removeLayer(poly);poly=null}
   dots.forEach(function(d){amap.removeLayer(d)});dots=[];
-  if(pts.length>=2)poly=L.polygon(pts,{color:"#1f6fb5",weight:2,fillOpacity:0.2}).addTo(amap);
-  dots=pts.map(function(p){return L.circleMarker(p,{radius:6,color:"#fff",weight:2,fillColor:"#1f6fb5",fillOpacity:1}).addTo(amap)});
-  $("area").textContent=pts.length<3?(pts.length+" corner"+(pts.length===1?"":"s")+" so far. A farm needs at least 3."):(pts.length+" corners, about "+areaHa(pts).toFixed(1)+" ha");
+  if(pts.length>=2)poly=L.polygon(pts,{color:crosses(pts)?"#e0533c":"#2fd08a",weight:3,fillColor:"#2fd08a",fillOpacity:.22,dashArray:pts.length<3?"6 6":null}).addTo(amap);
+  dots=pts.map(function(p,i){var m=L.marker(p,{draggable:true,icon:L.divIcon({className:"vx",html:"<span>"+(i+1)+"</span>",iconSize:[26,26],iconAnchor:[13,13]})}).addTo(amap);
+    m.on("drag",function(e){pts[i]=[e.latlng.lat,e.latlng.lng];if(poly)poly.setLatLngs(pts);liveInfo()});m.on("dragend",redraw);return m});
+  liveInfo();
 }
 function initAddMap(){
   if(amap){amap.invalidateSize();return}
   if(typeof L==="undefined"){$("map").textContent="The map could not load. Check your connection and reload.";return}
   amap=L.map("map").setView([20,0],2);
-  var sat=L.tileLayer(SAT,{maxZoom:19,attribution:"Tiles &copy; Esri"}),osm=L.tileLayer(OSM,{maxZoom:19,attribution:"&copy; OpenStreetMap contributors"});
-  sat.addTo(amap);L.control.layers({"Satellite":sat,"Map":osm}).addTo(amap);
+  var sat=L.tileLayer(SAT,{maxZoom:19,attribution:"Tiles &copy; Esri"}),osm=L.tileLayer(OSM,{maxZoom:19,attribution:"&copy; OpenStreetMap contributors"}),
+      lbl=L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",{maxZoom:19,attribution:"Labels &copy; Esri"});
+  sat.addTo(amap);lbl.addTo(amap);L.control.layers({"Satellite":sat,"Street map":osm},{"Place names":lbl}).addTo(amap);L.control.scale({imperial:true,metric:true}).addTo(amap);
   amap.on("click",function(e){pts.push([e.latlng.lat,e.latlng.lng]);redraw()});
-  amap.on("locationerror",function(){say("Could not get your location. Search for a place instead.",1)});
+  amap.on("locationfound",function(){say("")});
+  amap.on("locationerror",function(){say("Could not get your location. Allow location for this site, or search for a place instead.",1)});
   redraw();
 }
 $("addToggle").addEventListener("click",function(){var p=$("addPanel");p.hidden=!p.hidden;if(!p.hidden){initAddMap();p.scrollIntoView({behavior:"smooth",block:"start"})}});
 $("undo").addEventListener("click",function(){pts.pop();redraw()});
 $("clear").addEventListener("click",function(){pts=[];redraw()});
-$("loc").addEventListener("click",function(){if(amap)amap.locate({setView:true,maxZoom:17})});
+$("loc").addEventListener("click",function(){if(amap){say("Finding you…");amap.locate({setView:true,maxZoom:18})}});
+function goTo(x){if(amap)amap.setView([parseFloat(x.lat),parseFloat(x.lon)],17);$("results").innerHTML="";say("")}
+var RES=[];
 async function search(){
   var q=$("q").value.trim();if(!q||!amap)return;
-  try{var r=await fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="+encodeURIComponent(q));var j=await r.json();
-    if(!j.length)return say("Place not found. Try a nearby town.",1);amap.setView([parseFloat(j[0].lat),parseFloat(j[0].lon)],16);say("")}
+  try{var r=await fetch("https://nominatim.openstreetmap.org/search?format=json&limit=5&q="+encodeURIComponent(q));RES=await r.json();
+    if(!RES.length)return say("Place not found. Try a nearby town.",1);
+    if(RES.length===1)return goTo(RES[0]);
+    $("results").innerHTML=RES.map(function(x,i){return '<button type="button" class="b alt sm" data-i="'+i+'">'+esc(x.display_name.split(",").slice(0,3).join(","))+'</button>'}).join("");say("Several places match. Tap the right one.")}
   catch(e){say("Search is unavailable right now.",1)}
 }
+$("results").addEventListener("click",function(e){var b=e.target.closest("button[data-i]");if(b)goTo(RES[parseInt(b.getAttribute("data-i"),10)])});
 $("go").addEventListener("click",search);
 $("q").addEventListener("keydown",function(e){if(e.key==="Enter")search()});
+/* boundary files: GeoJSON or KML, one or many fields */
+function ringOf(coords){var r=coords.map(function(c){return [c[1],c[0]]});if(r.length>1&&r[0][0]===r[r.length-1][0]&&r[0][1]===r[r.length-1][1])r.pop();return r}
+function parseBoundary(text){
+  var out=[],s=text.trim();
+  if(s.charAt(0)==="<"){
+    (s.match(/<Placemark[\s\S]*?<\/Placemark>/gi)||[]).forEach(function(pm){
+      var nm=(pm.match(/<name>([\s\S]*?)<\/name>/i)||[])[1];
+      (pm.match(/<Polygon[\s\S]*?<\/Polygon>/gi)||[]).forEach(function(pg){
+        var co=(pg.match(/<coordinates>([\s\S]*?)<\/coordinates>/i)||[])[1];if(!co)return;
+        var c=co.trim().split(/\s+/).map(function(x){var q=x.split(",");return [parseFloat(q[0]),parseFloat(q[1])]}).filter(function(q){return isFinite(q[0])&&isFinite(q[1])});
+        out.push({name:(nm||"").replace(/<!\[CDATA\[|\]\]>/g,"").trim(),ring:ringOf(c)})})});
+  }else{
+    var g=JSON.parse(s),feats=g.type==="FeatureCollection"?g.features:g.type==="Feature"?[g]:[{type:"Feature",properties:{},geometry:g}];
+    feats.forEach(function(f){var gm=f.geometry||{},pr=f.properties||{},nm=pr.name||pr.Name||pr.NAME||"";
+      if(gm.type==="Polygon")out.push({name:nm,ring:ringOf(gm.coordinates[0])});
+      else if(gm.type==="MultiPolygon")gm.coordinates.forEach(function(pg,i){out.push({name:nm?nm+" "+(i+1):"",ring:ringOf(pg[0])})})})
+  }
+  return out.filter(function(f){return f.ring.length>=3&&f.ring.every(function(q){return Math.abs(q[0])<=90&&Math.abs(q[1])<=180})});
+}
+$("impBtn").addEventListener("click",function(){$("imp").click()});
+$("imp").addEventListener("change",async function(){
+  var f=this.files[0];this.value="";if(!f)return;
+  try{var items=parseBoundary(await f.text());
+    if(!items.length)return say("No field outlines found in that file. Use a GeoJSON or KML file with polygons.",1);
+    if(items.length>20)items=items.slice(0,20);
+    if(items.length===1){pts=items[0].ring;if(items[0].name&&!$("fn").value)$("fn").value=items[0].name;if(amap){amap.fitBounds(L.latLngBounds(pts),{padding:[30,30]})}redraw();return say("Boundary loaded. Check it, add the crop, then Save farm.")}
+    if(!confirm("Add "+items.length+" fields from this file?"))return;
+    var ok=0;
+    for(var i=0;i<items.length;i++){
+      try{await api("POST","addfarm",{name:items[i].name||("Field "+(DATA.farms.length+ok+1)),crop:$("fc").value,geometry:{type:"Polygon",coordinates:[items[i].ring.map(function(q){return [q[1],q[0]]}).concat([[items[i].ring[0][1],items[i].ring[0][0]]])]}});ok++;say("Added "+ok+" of "+items.length+"…")}
+      catch(e){say("Added "+ok+" of "+items.length+". "+e.message,1);break}}
+    pts=[];redraw();$("addPanel").hidden=true;await load();if(ok===items.length)say("Added "+ok+" fields. Tap Update satellite data to load their first readings.");
+  }catch(e){say("Could not read that file. Use a GeoJSON or KML file.",1)}
+});
 $("save").addEventListener("click",async function(){
   if(pts.length<3)return say("Tap at least 3 corners on the map first.",1);
+  if(crosses(pts))return say("The outline crosses itself. Drag a corner or tap Undo first.",1);
   var ring=pts.map(function(p){return [p[1],p[0]]});ring.push(ring[0]);
   var b=this;b.disabled=true;
   try{
-    var r=await api("POST","addfarm",{name:$("fn").value,crop:$("fc").value,geometry:{type:"Polygon",coordinates:[ring]}});
+    var r=await api("POST","addfarm",{name:$("fn").value||("Field "+(DATA.farms.length+1)),crop:$("fc").value,geometry:{type:"Polygon",coordinates:[ring]}});
     say("Added the farm ("+r.areaHa+" ha). Tap Update satellite data to load its first readings.");
     $("fn").value="";$("fc").value="";pts=[];redraw();$("addPanel").hidden=true;sel=r.id;await load();
   }catch(e){say(e.message,1)}
@@ -2622,6 +2827,7 @@ async function loadAlmanac(f){
 /* ---------- tabs ---------- */
 var VIEWS=["Farms","Advisor","Labor"],AI_ON=false;
 function showView(v){
+  if(typeof omap!=="undefined"&&omap)setTimeout(function(){omap.invalidateSize()},80);
   VIEWS.forEach(function(n){var el=$("view"+n);if(el)el.hidden=(n!==v)});
   Array.prototype.forEach.call(document.querySelectorAll("#tabs button"),function(b){b.className=b.getAttribute("data-view")===v?"on":""});
   if(v==="Advisor")openAdvisor();
@@ -2918,7 +3124,7 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        self.send_header("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
+        self.send_header("Permissions-Policy", "camera=(self), microphone=(self), geolocation=(self)")
         self.send_header("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
@@ -3045,6 +3251,11 @@ class handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 return self._json(200, farms_payload(user["id"]))
+            if r == "report":
+                if not user:
+                    return self._json(401, {"error": "Please log in."})
+                q = self._query().get("id", "all")
+                return self._send(200, report_html(user, farms_payload(user["id"]), None if q == "all" else int(q or 0)), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
             if r in ("almanac", "chats", "labor", "laborcsv"):
                 if not user:
                     return self._json(401, {"error": "Please log in."})
