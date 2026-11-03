@@ -237,6 +237,9 @@ def ensure_schema():
                 user_id INTEGER NOT NULL REFERENCES fw_users(id) ON DELETE CASCADE,
                 farm_id INTEGER REFERENCES fw_farms(id) ON DELETE CASCADE,
                 question TEXT NOT NULL, answer TEXT NOT NULL, had_image INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL)""")
+            sql("""CREATE TABLE IF NOT EXISTS fw_questions (
+                id SERIAL PRIMARY KEY, name TEXT, email TEXT, message TEXT NOT NULL, created TEXT NOT NULL,
+                reply TEXT, replied TEXT, public INTEGER NOT NULL DEFAULT 0)""")
             sql("""CREATE TABLE IF NOT EXISTS fw_resets (
                 token_hash TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES fw_users(id) ON DELETE CASCADE,
@@ -2253,7 +2256,30 @@ def aqas_log_daily(result):
         print("AQAS log failed:", e, file=sys.stderr)
 
 
-AQAS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AQAS Pro Control Room</title><style>:root{color-scheme:dark;--line:#26364f;--muted:#a8b7cc;--text:#f4f7fb;--accent:#7dd3fc;--amber:#fcd34d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#162846,#0a1020 60%);color:var(--text);font:15px system-ui,sans-serif}.wrap{max-width:1150px;margin:auto;padding:28px 18px 60px}.top,.sectionhead{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.brand{font-size:12px;letter-spacing:.2em;color:var(--accent);font-weight:800}.subtitle,.muted{color:var(--muted);font-size:13px}.badge,.status{border:1px solid #806b2e;color:var(--amber);border-radius:99px;padding:7px 11px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:24px 0}.card,section{background:rgba(17,27,46,.94);border:1px solid var(--line);border-radius:16px;padding:18px}.notice{background:#172a40;border:1px solid #31506c;padding:12px;border-radius:10px;margin:14px 0}.tokenbox,.row{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.tokenbox input{flex:1;min-width:220px}.proposal,.event{border-top:1px solid var(--line);padding:14px 0}.risk{font-size:11px;text-transform:uppercase;color:var(--amber)}.risk.high{color:#fca5a5}.risk.low{color:#86efac}button,input,textarea,select{font:inherit;border-radius:9px;border:1px solid #344761;padding:10px;background:#0b1425;color:var(--text)}button{cursor:pointer;background:#173c59;border-color:#2b6c91}button.secondary{background:#1c293d}button.danger{background:#51272c}input,select,textarea{width:100%}textarea{min-height:70px}label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.wide{grid-column:1/-1}.empty{color:var(--muted);padding:16px 0}@media(max-width:600px){.formgrid{grid-template-columns:1fr}.wide{grid-column:auto}}</style></head><body><div class="wrap"><div class="top"><div><div class="brand">AQAS PRO / CONTROL ROOM</div><h1 style="margin:7px 0 0">FarmWatch Operations</h1><div class="subtitle">Supervisor foundation · auditable · human-approved</div></div><span class="badge">SIMULATION MODE · NO LIVE AGENT ACTIONS</span></div><div class="notice">Phase 1 is intentionally safe: agents are paused and simulated. Approving a proposal records the decision only; it does not change production systems or send outreach.</div><div class="tokenbox"><input id="token" type="password" autocomplete="off" placeholder="AQAS_ADMIN_TOKEN (not your OpenAI key)"><button onclick="saveToken()">Connect control room</button><button class="secondary" onclick="refresh()">Refresh</button></div><div id="message" class="muted">Set AQAS_ADMIN_TOKEN in Render, then enter the same value here.</div><div id="agents" class="grid"></div><section><div class="sectionhead"><h2>Farm Watch health</h2><span class="muted">Live counts from the running system</span></div><div id="health" class="grid"></div></section><section><div class="sectionhead"><h2>Go-live check</h2><span class="muted">Tests every connected service</span></div><button id="chkbtn" type="button" onclick="runCheck()">Run check</button><div id="chk"></div></section><section><div class="sectionhead"><h2>Accounts</h2><span class="muted">Everyone who has signed up</span></div><div id="accts" class="empty">Connect to load accounts.</div></section><section><div class="sectionhead"><h2>Proposal queue</h2><span class="muted">All behavior changes require approval</span></div><div id="proposals" class="empty">Connect to load proposals.</div></section><section style="margin-top:16px"><div class="sectionhead"><h2>Create a proposal</h2><span class="muted">No direct execution</span></div><form id="proposalForm"><div class="formgrid"><div><label>Agent</label><select id="agent"><option>ARAIAH</option><option>Pluto</option><option>Orion</option><option>AQAS</option></select></div><div><label>Risk level</label><select id="risk"><option>low</option><option>medium</option><option>high</option></select></div><div class="wide"><label>Proposal title</label><input id="title" required maxlength="180"></div><div class="wide"><label>Reason / evidence</label><textarea id="rationale" required maxlength="2000"></textarea></div><div class="wide"><label>Expected effect</label><textarea id="effect" required maxlength="1000"></textarea></div><div class="wide"><label>Proposed change (plain-language description)</label><textarea id="change" maxlength="2000"></textarea></div></div><div class="row"><button type="submit">Submit for review</button></div></form></section><section style="margin-top:16px"><div class="sectionhead"><h2>Audit trail</h2><span class="muted">Most recent 50 events</span></div><div id="events" class="empty">Connect to load events.</div></section></div><script>const $=id=>document.getElementById(id);function token(){return sessionStorage.getItem('aqas_admin_token')||''}function saveToken(){sessionStorage.setItem('aqas_admin_token',$('token').value.trim());refresh()}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function api(r,method='GET',body){const res=await fetch('?r='+encodeURIComponent(r),{method,headers:{'Authorization':'Bearer '+token(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store'});let d={};try{d=await res.json()}catch{}if(!res.ok)throw Error(d.error||'Request failed ('+res.status+')');return d}async function refresh(){if($('token').value)sessionStorage.setItem('aqas_admin_token',$('token').value.trim());$('message').textContent='Connecting…';try{const d=await api('aqas-status');loadAccts();try{const h=await api('aqas-health');$('health').innerHTML=h.cards.map(c=>`<div class="card"><div class="muted">${esc(c.label)}</div><h2 style="margin:6px 0 0">${esc(c.value)}</h2><div class="muted">${esc(c.note||'')}</div></div>`).join('')}catch(e){$('health').innerHTML=''}$('message').textContent='Connected · OpenAI key '+(d.openaiConfigured?'configured':'not configured')+' · live agent actions disabled';$('agents').innerHTML=d.agents.map(a=>`<div class="card"><div class="sectionhead"><h3>${esc(a.agent)}</h3><span class="status">${esc(a.status)}</span></div><div class="muted">${esc((a.metrics||{}).description||'Specialist agent')}</div><p>Mode: <b>${esc(a.mode)}</b></p><p>Daily contact cap: <b>${esc(a.daily_cap)}</b></p><div class="row"><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','paused')">Pause</button><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','simulated')">Set simulated</button></div></div>`).join('');$('proposals').innerHTML=d.pendingProposals.length?d.pendingProposals.map(p=>`<div class="proposal"><div class="sectionhead"><h3>${esc(p.title)}</h3><span class="risk ${esc(p.risk)}">${esc(p.risk)} risk</span></div><div class="muted">${esc(p.agent)} · ${esc(p.created_at)}</div><p>${esc(p.rationale)}</p><p><b>Expected effect:</b> ${esc(p.expected_effect)}</p><p class="muted">Proposed change: ${esc(JSON.stringify(p.proposed_change))}</p><div class="row"><button onclick="decide(${p.id},'approved')">Approve record</button><button class="danger" onclick="decide(${p.id},'rejected')">Reject</button></div></div>`).join(''):'<div class="empty">No pending proposals.</div>';$('events').innerHTML=d.events.length?d.events.map(e=>`<div class="event"><div class="muted">${esc(e.occurred_at)} · ${esc(e.actor)} · ${esc(e.event_type)} ${e.agent?'· '+esc(e.agent):''}</div><div>${esc(e.summary)}</div></div>`).join(''):'<div class="empty">No events yet.</div>'}catch(e){$('message').textContent=e.message;$('agents').innerHTML='';$('proposals').innerHTML='<div class="empty">Not connected.</div>'}}async function runCheck(){const b=$('chkbtn');b.disabled=true;b.textContent='Checking…';try{const a=await api('aqas-selfcheck');const ic={ok:'✅',warn:'⚠️',fail:'❌'};$('chk').innerHTML='<p class="muted" style="margin:10px 0"><b>'+esc(a.summary)+'</b></p>'+a.checks.map(c=>`<div class="card" style="margin-top:8px"><b>${ic[c.status]} ${esc(c.name)}</b><div class="muted">${esc(c.detail)}</div>${c.fix?`<div style="margin-top:4px">${esc(c.fix)}</div>`:''}</div>`).join('')}catch(e){$('chk').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}b.disabled=false;b.textContent='Run check again'}async function loadAccts(){try{const a=await api('aqas-accounts');const s=a.summary,p=a.payments;$('accts').className='';$('accts').innerHTML='<div class="grid">'+[['Accounts',s.total],['Paying',s.active],['Trial',s.trial],['New this week',s.newWeek]].map(x=>`<div class="card"><div class="muted">${x[0]}</div><h2 style="margin:6px 0 0">${x[1]}</h2></div>`).join('')+'</div><p class="muted" style="margin:10px 0">Payments: Stripe link '+(p.stripe?'on':'off')+' · PayPal link '+(p.paypal?'on':'off')+' · Stripe auto-update '+(p.webhook?'on':'off')+'</p>'+(a.accounts.map(u=>`<div class="card" style="margin-top:10px"><b>${esc(u.email)}</b>${u.disabled?' <span class="muted">(paused)</span>':''}<div class="muted">${esc(u.name)} · joined ${esc((u.created||'').slice(0,10))} · ${u.farms} farms, ${u.ha} ha · last seen ${esc((u.lastSeen||'never').slice(0,10))}</div><div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><select onchange="setAcct(${u.id},{plan:this.value})">${['trial','active','past_due','cancelled','free'].map(k=>`<option value="${k}"${k===u.plan?' selected':''}>${k}</option>`).join('')}</select><button type="button" onclick="setAcct(${u.id},{disabled:${u.disabled?'false':'true'}})">${u.disabled?'Resume':'Pause'} account</button></div></div>`).join('')||'<div class="empty">No accounts yet.</div>')}catch(e){$('accts').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}async function setAcct(id,body){try{await api('aqas-account','POST',Object.assign({id},body));await loadAccts()}catch(e){alert(e.message)}}async function pauseAgent(agent,status){try{await api('aqas-agent-control','POST',{agent,status});await refresh()}catch(e){alert(e.message)}}async function decide(id,status){const note=prompt('Review note (required for audit):');if(note===null)return;try{await api('aqas-decision','POST',{id,status,note});await refresh()}catch(e){alert(e.message)}}$('proposalForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('aqas-propose','POST',{agent:$('agent').value,risk:$('risk').value,title:$('title').value,rationale:$('rationale').value,expectedEffect:$('effect').value,change:$('change').value});e.target.reset();await refresh()}catch(err){alert(err.message)}});$('token').value=token();if(token())refresh();</script></body></html>
+AQAS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AQAS Pro Control Room</title><style>:root{color-scheme:dark;--line:#26364f;--muted:#a8b7cc;--text:#f4f7fb;--accent:#7dd3fc;--amber:#fcd34d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#162846,#0a1020 60%);color:var(--text);font:15px system-ui,sans-serif}.wrap{max-width:1150px;margin:auto;padding:28px 18px 60px}.top,.sectionhead{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.brand{font-size:12px;letter-spacing:.2em;color:var(--accent);font-weight:800}.subtitle,.muted{color:var(--muted);font-size:13px}.badge,.status{border:1px solid #806b2e;color:var(--amber);border-radius:99px;padding:7px 11px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:24px 0}.card,section{background:rgba(17,27,46,.94);border:1px solid var(--line);border-radius:16px;padding:18px}.notice{background:#172a40;border:1px solid #31506c;padding:12px;border-radius:10px;margin:14px 0}.tokenbox,.row{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.tokenbox input{flex:1;min-width:220px}.proposal,.event{border-top:1px solid var(--line);padding:14px 0}.risk{font-size:11px;text-transform:uppercase;color:var(--amber)}.risk.high{color:#fca5a5}.risk.low{color:#86efac}button,input,textarea,select{font:inherit;border-radius:9px;border:1px solid #344761;padding:10px;background:#0b1425;color:var(--text)}button{cursor:pointer;background:#173c59;border-color:#2b6c91}button.secondary{background:#1c293d}button.danger{background:#51272c}input,select,textarea{width:100%}textarea{min-height:70px}label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.wide{grid-column:1/-1}.empty{color:var(--muted);padding:16px 0}@media(max-width:600px){.formgrid{grid-template-columns:1fr}.wide{grid-column:auto}}</style></head><body><div class="wrap"><div class="top"><div><div class="brand">AQAS PRO / CONTROL ROOM</div><h1 style="margin:7px 0 0">FarmWatch Operations</h1><div class="subtitle">Supervisor foundation · auditable · human-approved</div></div><span class="badge">SIMULATION MODE · NO LIVE AGENT ACTIONS</span></div><div class="notice">Phase 1 is intentionally safe: agents are paused and simulated. Approving a proposal records the decision only; it does not change production systems or send outreach.</div><div class="tokenbox"><input id="token" type="password" autocomplete="off" placeholder="AQAS_ADMIN_TOKEN (not your OpenAI key)"><button onclick="saveToken()">Connect control room</button><button class="secondary" onclick="refresh()">Refresh</button></div><div id="message" class="muted">Set AQAS_ADMIN_TOKEN in Render, then enter the same value here.</div><div id="agents" class="grid"></div><section><div class="sectionhead"><h2>Farm Watch health</h2><span class="muted">Live counts from the running system</span></div><div id="health" class="grid"></div></section><section><div class="sectionhead"><h2>Go-live check</h2><span class="muted">Tests every connected service</span></div><button id="chkbtn" type="button" onclick="runCheck()">Run check</button><div id="chk"></div></section><section><div class="sectionhead"><h2>Add a client</h2><span class="muted">They choose their own password</span></div><div class="card"><input id="nc_name" placeholder="Client name"> <input id="nc_email" type="email" placeholder="Client email"> <select id="nc_plan"><option value="alumni">alumni</option><option value="basic">basic</option><option value="commercial">commercial</option><option value="trial">trial</option></select> <label><input id="nc_send" type="checkbox"> email the invite</label> <button type="button" onclick="newClient()">Create client</button><div id="nc_out" class="muted" style="margin-top:8px"></div></div></section><section><div class="sectionhead"><h2>Clients</h2><span class="muted">Usage only. Clients control their own farming</span></div><div id="accts" class="empty">Connect to load clients.</div></section><section><div class="sectionhead"><h2>All fields</h2><span class="muted">Every client, driest first</span></div><div id="fields" class="empty">Connect to load fields.</div></section><section><div class="sectionhead"><h2>Questions</h2><span class="muted">From your website</span></div><div id="qs" class="empty">Connect to load questions.</div></section><section><div class="sectionhead"><h2>Proposal queue</h2><span class="muted">All behavior changes require approval</span></div><div id="proposals" class="empty">Connect to load proposals.</div></section><section style="margin-top:16px"><div class="sectionhead"><h2>Create a proposal</h2><span class="muted">No direct execution</span></div><form id="proposalForm"><div class="formgrid"><div><label>Agent</label><select id="agent"><option>ARAIAH</option><option>Pluto</option><option>Orion</option><option>AQAS</option></select></div><div><label>Risk level</label><select id="risk"><option>low</option><option>medium</option><option>high</option></select></div><div class="wide"><label>Proposal title</label><input id="title" required maxlength="180"></div><div class="wide"><label>Reason / evidence</label><textarea id="rationale" required maxlength="2000"></textarea></div><div class="wide"><label>Expected effect</label><textarea id="effect" required maxlength="1000"></textarea></div><div class="wide"><label>Proposed change (plain-language description)</label><textarea id="change" maxlength="2000"></textarea></div></div><div class="row"><button type="submit">Submit for review</button></div></form></section><section style="margin-top:16px"><div class="sectionhead"><h2>Audit trail</h2><span class="muted">Most recent 50 events</span></div><div id="events" class="empty">Connect to load events.</div></section></div><script>const $=id=>document.getElementById(id);function token(){return sessionStorage.getItem('aqas_admin_token')||''}function saveToken(){sessionStorage.setItem('aqas_admin_token',$('token').value.trim());refresh()}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function api(r,method='GET',body){const res=await fetch('?r='+encodeURIComponent(r),{method,headers:{'Authorization':'Bearer '+token(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store'});let d={};try{d=await res.json()}catch{}if(!res.ok)throw Error(d.error||'Request failed ('+res.status+')');return d}async function refresh(){if($('token').value)sessionStorage.setItem('aqas_admin_token',$('token').value.trim());$('message').textContent='Connecting…';try{const d=await api('aqas-status');loadAccts();loadFields();loadQs();try{const h=await api('aqas-health');$('health').innerHTML=h.cards.map(c=>`<div class="card"><div class="muted">${esc(c.label)}</div><h2 style="margin:6px 0 0">${esc(c.value)}</h2><div class="muted">${esc(c.note||'')}</div></div>`).join('')}catch(e){$('health').innerHTML=''}$('message').textContent='Connected · OpenAI key '+(d.openaiConfigured?'configured':'not configured')+' · live agent actions disabled';$('agents').innerHTML=d.agents.map(a=>`<div class="card"><div class="sectionhead"><h3>${esc(a.agent)}</h3><span class="status">${esc(a.status)}</span></div><div class="muted">${esc((a.metrics||{}).description||'Specialist agent')}</div><p>Mode: <b>${esc(a.mode)}</b></p><p>Daily contact cap: <b>${esc(a.daily_cap)}</b></p><div class="row"><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','paused')">Pause</button><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','simulated')">Set simulated</button></div></div>`).join('');$('proposals').innerHTML=d.pendingProposals.length?d.pendingProposals.map(p=>`<div class="proposal"><div class="sectionhead"><h3>${esc(p.title)}</h3><span class="risk ${esc(p.risk)}">${esc(p.risk)} risk</span></div><div class="muted">${esc(p.agent)} · ${esc(p.created_at)}</div><p>${esc(p.rationale)}</p><p><b>Expected effect:</b> ${esc(p.expected_effect)}</p><p class="muted">Proposed change: ${esc(JSON.stringify(p.proposed_change))}</p><div class="row"><button onclick="decide(${p.id},'approved')">Approve record</button><button class="danger" onclick="decide(${p.id},'rejected')">Reject</button></div></div>`).join(''):'<div class="empty">No pending proposals.</div>';$('events').innerHTML=d.events.length?d.events.map(e=>`<div class="event"><div class="muted">${esc(e.occurred_at)} · ${esc(e.actor)} · ${esc(e.event_type)} ${e.agent?'· '+esc(e.agent):''}</div><div>${esc(e.summary)}</div></div>`).join(''):'<div class="empty">No events yet.</div>'}catch(e){$('message').textContent=e.message;$('agents').innerHTML='';$('proposals').innerHTML='<div class="empty">Not connected.</div>'}}function ringOf(coords){var r=coords.map(function(c){return [c[1],c[0]]});if(r.length>1&&r[0][0]===r[r.length-1][0]&&r[0][1]===r[r.length-1][1])r.pop();return r}
+function parseBoundary(text){
+  var out=[],s=text.trim();
+  if(s.charAt(0)==="<"){
+    (s.match(/<Placemark[\s\S]*?<\/Placemark>/gi)||[]).forEach(function(pm){
+      var nm=(pm.match(/<name>([\s\S]*?)<\/name>/i)||[])[1];
+      (pm.match(/<Polygon[\s\S]*?<\/Polygon>/gi)||[]).forEach(function(pg){
+        var co=(pg.match(/<coordinates>([\s\S]*?)<\/coordinates>/i)||[])[1];if(!co)return;
+        var c=co.trim().split(/\s+/).map(function(x){var q=x.split(",");return [parseFloat(q[0]),parseFloat(q[1])]}).filter(function(q){return isFinite(q[0])&&isFinite(q[1])});
+        out.push({name:(nm||"").replace(/<!\[CDATA\[|\]\]>/g,"").trim(),ring:ringOf(c)})})});
+  }else{
+    var g=JSON.parse(s),feats=g.type==="FeatureCollection"?g.features:g.type==="Feature"?[g]:[{type:"Feature",properties:{},geometry:g}];
+    feats.forEach(function(f){var gm=f.geometry||{},pr=f.properties||{},nm=pr.name||pr.Name||pr.NAME||"";
+      if(gm.type==="Polygon")out.push({name:nm,ring:ringOf(gm.coordinates[0])});
+      else if(gm.type==="MultiPolygon")gm.coordinates.forEach(function(pg,i){out.push({name:nm?nm+" "+(i+1):"",ring:ringOf(pg[0])})})})
+  }
+  return out.filter(function(f){return f.ring.length>=3&&f.ring.every(function(q){return Math.abs(q[0])<=90&&Math.abs(q[1])<=180})});
+}
+async function newClient(){const o=$('nc_out');try{const r=await api('aqas-create-client','POST',{name:$('nc_name').value,email:$('nc_email').value,plan:$('nc_plan').value,send:$('nc_send').checked});o.innerHTML='Created. Send this private link (it works for 7 days)'+(r.emailed?' <b>and it was emailed</b>':'')+':<br><input readonly style="width:100%" value="'+esc(r.link)+'" onclick="this.select()">';$('nc_name').value='';$('nc_email').value='';loadAccts()}catch(e){o.textContent=e.message}}
+function addFieldFor(uid){const i=document.createElement('input');i.type='file';i.accept='.geojson,.json,.kml';i.onchange=async()=>{const f=i.files[0];if(!f)return;try{const items=parseBoundary(await f.text());if(!items.length)return alert('No field outlines found in that file.');const crop=prompt('Crop for these fields? (optional)','')||'';let ok=0;for(const it of items.slice(0,20)){try{await api('aqas-add-farm','POST',{userId:uid,name:it.name||('Field '+(ok+1)),crop,geometry:{type:'Polygon',coordinates:[it.ring.map(q=>[q[1],q[0]]).concat([[it.ring[0][1],it.ring[0][0]]])]}});ok++}catch(e){alert('Added '+ok+'. '+e.message);break}}alert('Added '+ok+' field(s).');loadAccts();loadFields()}catch(e){alert('Could not read that file.')}};i.click()}
+async function loadFields(){try{const a=await api('aqas-fields'),s=a.summary,col={Dry:'#e0533c',Watch:'#f0a21b',Moist:'#2f9bd8'};$('fields').className='';$('fields').innerHTML='<p class="muted" style="margin:0 0 8px">'+s.fields+' fields · '+s.ha+' ha · '+s.dry+' dry · '+s.watch+' watch · '+s.stale+' with no fresh reading in 14 days</p>'+(a.fields.map(f=>`<div class="card" style="margin-top:8px;border-left:5px solid ${col[f.status]||'#8a9a92'}"><b>${esc(f.name)}</b> <span class="muted">${esc(f.crop)} · ${f.ha} ha</span><div class="muted">${esc(f.client)} · <b>${esc(f.status)}</b>${f.ndmi!==null?' ('+f.ndmi+')':''} · ${f.lastReading?('last reading '+esc(f.lastReading)):'no satellite reading yet'}</div></div>`).join('')||'<div class="empty">No fields yet.</div>')}catch(e){$('fields').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
+async function loadQs(){try{const a=await api('aqas-questions');$('qs').className='';$('qs').innerHTML=a.questions.map(q=>`<div class="card" style="margin-top:8px"><b>${esc(q.name||'Visitor')}</b> <span class="muted">${esc(q.email)} · ${esc(q.created.slice(0,10))}</span><p style="margin:6px 0">${esc(q.message)}</p>${q.reply?'<div class="muted">Your reply'+(q.public?' (shown on the website)':'')+': '+esc(q.reply)+'</div>':''}<textarea id="rp${q.id}" rows="2" style="width:100%" placeholder="Write a reply">${esc(q.reply)}</textarea><label><input id="rpp${q.id}" type="checkbox"${q.public?' checked':''}> show on the website FAQ</label> <button type="button" onclick="replyQ(${q.id})">Send reply</button></div>`).join('')||'<div class="empty">No questions yet.</div>'}catch(e){$('qs').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
+async function replyQ(id){try{await api('aqas-reply','POST',{id,reply:$('rp'+id).value,public:$('rpp'+id).checked});await loadQs()}catch(e){alert(e.message)}}
+async function runCheck(){const b=$('chkbtn');b.disabled=true;b.textContent='Checking…';try{const a=await api('aqas-selfcheck');const ic={ok:'✅',warn:'⚠️',fail:'❌'};$('chk').innerHTML='<p class="muted" style="margin:10px 0"><b>'+esc(a.summary)+'</b></p>'+a.checks.map(c=>`<div class="card" style="margin-top:8px"><b>${ic[c.status]} ${esc(c.name)}</b><div class="muted">${esc(c.detail)}</div>${c.fix?`<div style="margin-top:4px">${esc(c.fix)}</div>`:''}</div>`).join('')}catch(e){$('chk').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}b.disabled=false;b.textContent='Run check again'}async function loadAccts(){try{const a=await api('aqas-accounts');const s=a.summary,p=a.payments;$('accts').className='';$('accts').innerHTML='<div class="grid">'+[['Clients',s.total],['Paying',s.active],['Active this week',s.activeWeek],['Alumni spots left',Math.max(0,10-s.alumni)]].map(x=>`<div class="card"><div class="muted">${x[0]}</div><h2 style="margin:6px 0 0">${x[1]}</h2></div>`).join('')+'</div><p class="muted" style="margin:10px 0">Payments: Stripe link '+(p.stripe?'on':'off')+' · PayPal link '+(p.paypal?'on':'off')+' · Stripe auto-update '+(p.webhook?'on':'off')+'</p>'+(a.accounts.map(u=>`<div class="card" style="margin-top:10px"><b>${esc(u.email)}</b>${u.disabled?' <span class="muted">(paused)</span>':''}<div class="muted">${esc(u.name)} · joined ${esc((u.created||'').slice(0,10))} · <b>${esc(u.activity)}</b> · last seen ${esc((u.lastSeen||'never').slice(0,10))}</div><div class="muted">${u.farms} fields, ${u.ha} ha · ${u.logs30} activity entries in 30 days · ${u.ai7} Advisor questions this week</div><div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><select onchange="setAcct(${u.id},{plan:this.value})">${['trial','alumni','basic','commercial','active','past_due','cancelled','free'].map(k=>`<option value="${k}"${k===u.plan?' selected':''}>${k}</option>`).join('')}</select><button type="button" onclick="addFieldFor(${u.id})">Add field from file</button><button type="button" onclick="setAcct(${u.id},{disabled:${u.disabled?'false':'true'}})">${u.disabled?'Resume':'Pause'} account</button></div></div>`).join('')||'<div class="empty">No accounts yet.</div>')}catch(e){$('accts').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}async function setAcct(id,body){try{await api('aqas-account','POST',Object.assign({id},body));await loadAccts()}catch(e){alert(e.message)}}async function pauseAgent(agent,status){try{await api('aqas-agent-control','POST',{agent,status});await refresh()}catch(e){alert(e.message)}}async function decide(id,status){const note=prompt('Review note (required for audit):');if(note===null)return;try{await api('aqas-decision','POST',{id,status,note});await refresh()}catch(e){alert(e.message)}}$('proposalForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('aqas-propose','POST',{agent:$('agent').value,risk:$('risk').value,title:$('title').value,rationale:$('rationale').value,expectedEffect:$('effect').value,change:$('change').value});e.target.reset();await refresh()}catch(err){alert(err.message)}});$('token').value=token();if(token())refresh();</script></body></html>
 """
 
 
@@ -2462,10 +2488,11 @@ input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0
     <p class="note">Guidance only. Irrigation and risk advice is indicative and depends on your soil, crop stage and equipment. Satellite moisture (NDMI) measures canopy moisture, not soil moisture directly. Weather forecast data: Open-Meteo. Satellite data: Copernicus Sentinel-2.</p>
   </div>
 </div>
-<footer class="foot"><p>By using Farm Watch you agree to the <a href="?r=terms">Terms</a> and <a href="?r=privacy">Privacy Policy</a>. Guidance only, not a substitute for a local agronomist.</p><div id="payCard" class="panel" hidden style="margin:0 0 14px"></div><p><button id="delAcct" type="button" class="b alt" hidden>Delete my account</button></p><p class="d">© 2026 A1 AI</p></footer>
+<footer class="foot"><p>By using Farm Watch you agree to the <a href="?r=terms">Terms</a> and <a href="?r=privacy">Privacy Policy</a>. Guidance only, not a substitute for a local agronomist.</p><p id="installTip" class="help" hidden></p><div id="payCard" class="panel" hidden style="margin:0 0 14px"></div><p><button id="delAcct" type="button" class="b alt" hidden>Delete my account</button></p><p class="d">© 2026 A1 AI</p></footer>
 <style>.foot{max-width:760px;margin:10px auto 40px;padding:0 18px;font-size:13px;color:var(--mute)}.foot a{color:var(--wet);font-weight:600}.foot .d{opacity:.7}</style>
 <script>window.fwTip=function(e,svg){try{var s=JSON.parse(svg.getAttribute("data-s")),th=svg.getAttribute("data-th").split(","),p=+svg.getAttribute("data-p"),W=+svg.getAttribute("data-w"),r=svg.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W,i=Math.max(0,Math.min(s.length-1,Math.round((x-p)/(W-2*p)*(s.length-1)))),a=s[i],px=p+i*(W-2*p)/Math.max(1,s.length-1),st=a[1]<+th[0]?"Dry":a[1]<+th[1]?"Watch":"Moist",l=svg.querySelector(".cl");l.setAttribute("x1",px);l.setAttribute("x2",px);l.setAttribute("opacity",".5");svg.querySelector(".tt").textContent=a[0]+": moisture "+a[1].toFixed(2)+" ("+st+")"+(a[2]!=null?", greenness "+a[2].toFixed(2):"")}catch(_){}};
-window.fwPay=function(show){var c=document.getElementById("payCard");if(show===false){c.hidden=true;return}fetch("?r=me").then(function(r){return r.json()}).then(function(d){var u=d.user,p=d.pay||{};if(!u||(!p.stripe&&!p.paypal)){c.hidden=true;return}var L={trial:"Free pilot",active:"Active subscription",past_due:"Payment issue",cancelled:"Cancelled",free:"Free"};var h="<h2>Your plan: "+(L[u.plan]||"Free pilot")+"</h2>";if(u.plan!=="active"&&u.plan!=="free"){h+="<p class=\"help\" style=\"margin:0 0 10px\">Subscribe to keep Farm Watch running for your fields.</p>";if(p.stripe)h+="<a class=\"b\" style=\"display:block;text-align:center;text-decoration:none;margin-bottom:8px\" href=\""+p.stripe+"\" target=\"_blank\" rel=\"noopener\">Pay by card or Apple Pay</a>";if(p.paypal)h+="<a class=\"b alt\" style=\"display:block;text-align:center;text-decoration:none\" href=\""+p.paypal+"\" target=\"_blank\" rel=\"noopener\">Pay with PayPal</a><p class=\"help\" style=\"margin:8px 0 0\">PayPal payments are confirmed by our team, usually within a day.</p>"}else h+="<p class=\"help\" style=\"margin:0\">Thank you for being a customer.</p>";c.innerHTML=h;c.hidden=false}).catch(function(){c.hidden=true})};
+(function(){var c=document.getElementById("installTip");if(!c)return;var sa=(window.matchMedia&&matchMedia("(display-mode: standalone)").matches)||navigator.standalone;if(sa)return;if(/iphone|ipad|ipod/i.test(navigator.userAgent)){c.innerHTML="📲 Install Farm Watch on your phone: tap <b>Share</b>, then <b>Add to Home Screen</b>.";c.hidden=false}window.addEventListener("beforeinstallprompt",function(e){e.preventDefault();c.innerHTML='📲 <a href="#" id="instGo"><b>Install Farm Watch</b></a> on this phone.';c.hidden=false;document.getElementById("instGo").onclick=function(ev){ev.preventDefault();e.prompt()}})})();
+window.fwPay=function(show){var c=document.getElementById("payCard");if(show===false){c.hidden=true;return}fetch("?r=me").then(function(r){return r.json()}).then(function(d){var u=d.user,p=d.pay||{};if(!u||(!p.stripe&&!p.paypal)){c.hidden=true;return}var L={trial:"Free trial",alumni:"Alumni farm",basic:"Basic",commercial:"Commercial",active:"Active subscription",past_due:"Payment issue",cancelled:"Cancelled",free:"Free"};var h="<h2>Your plan: "+(L[u.plan]||"Free pilot")+"</h2>";if(["active","free","alumni","basic","commercial"].indexOf(u.plan)<0){h+="<p class=\"help\" style=\"margin:0 0 10px\">Subscribe to keep Farm Watch running for your fields.</p>";if(p.stripe)h+="<a class=\"b\" style=\"display:block;text-align:center;text-decoration:none;margin-bottom:8px\" href=\""+p.stripe+"\" target=\"_blank\" rel=\"noopener\">Pay by card or Apple Pay</a>";if(p.paypal)h+="<a class=\"b alt\" style=\"display:block;text-align:center;text-decoration:none\" href=\""+p.paypal+"\" target=\"_blank\" rel=\"noopener\">Pay with PayPal</a><p class=\"help\" style=\"margin:8px 0 0\">PayPal payments are confirmed by our team, usually within a day.</p>"}else h+="<p class=\"help\" style=\"margin:0\">Thank you for being a customer.</p>";c.innerHTML=h;c.hidden=false}).catch(function(){c.hidden=true})};
 document.getElementById("delAcct").addEventListener("click",function(){var pw=prompt("This permanently deletes your account, farms, logs and labor records. It cannot be undone.\n\nType your password to confirm:");if(!pw)return;fetch("?r=deleteaccount",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||"Could not delete.");alert("Your account has been deleted.");location.reload()})}).catch(function(e){alert(e.message)})});</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -2991,6 +3018,7 @@ def legal_page(kind):
 <h2>What we collect</h2><ul><li>Account details: your name, email and a hashed password.</li><li>Farm data you enter: field names, crops, boundaries, settings, activity logs and advice feedback.</li><li>Labor records if you use that feature: worker names, roles, pay rates and hours.</li><li>Advisor conversations: your questions and the answers. Photos are analysed to answer you and are not stored by us.</li></ul>
 <h2>How we use it</h2><p>Only to run Farm Watch for you: to fetch satellite and weather data for your fields, calculate advice, answer your questions and send emails you ask for, such as password resets. We do not sell your data and we do not show ads.</p>
 <h2>Who processes it for us</h2><ul><li>Hosting and database providers (Render and Neon) store the service and its data.</li><li>Copernicus Sentinel Hub receives your field boundaries to return satellite readings.</li><li>Open-Meteo receives field coordinates to return weather and climate data.</li><li>Our AI provider (Anthropic by default) receives your question, relevant field information and any photo you attach, to write an answer.</li><li>Map tile providers (Esri, OpenStreetMap) see map requests from your browser.</li><li>An email provider, if email is turned on.</li></ul>
+<h2>If A1 AI manages your account</h2><p>If we manage your fields for you, our team can see your fields and account activity, such as when you last signed in, so we can support and advise you. You keep control: you can change your own field settings at any time and delete your account whenever you like.</p>
 <h2>Cookies</h2><p>One essential sign-in cookie keeps you logged in. We do not use advertising or tracking cookies.</p>
 <h2>Retention and deletion</h2><p>We keep your data until you delete it. Use "Delete my account" in the footer of the app to permanently remove your account, farms, logs, labor records and conversations.</p>
 <h2>Security</h2><p>Passwords are hashed, connections are encrypted, and sign-in cookies are protected. No system is perfectly secure, so please use a strong, unique password.</p>
@@ -3029,7 +3057,8 @@ def config_warnings():
 STRIPE_PAYMENT_LINK = (os.environ.get("STRIPE_PAYMENT_LINK") or "").strip()
 PAYPAL_PAYMENT_LINK = (os.environ.get("PAYPAL_PAYMENT_LINK") or "").strip()
 STRIPE_WEBHOOK_SECRET = (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip()
-PLANS = ("trial", "active", "past_due", "cancelled", "free")
+PLANS = ("trial", "alumni", "basic", "commercial", "active", "past_due", "cancelled", "free")
+PAID_PLANS = ("alumni", "basic", "commercial", "active")
 
 
 def pay_links(user):
@@ -3048,14 +3077,24 @@ def aqas_accounts():
     users = sql("SELECT id, email, name, created, plan, disabled, last_seen FROM fw_users ORDER BY id DESC LIMIT 500")
     fm = {int(r["user_id"]): r for r in sql("SELECT user_id, COUNT(*) AS n, SUM(area_ha) AS ha FROM fw_farms GROUP BY user_id")}
     week = (date.today() - timedelta(days=7)).isoformat()
+    d30 = (date.today() - timedelta(days=30)).isoformat()
+    farm_user = {int(r["id"]): int(r["user_id"]) for r in sql("SELECT id, user_id FROM fw_farms")}
+    lc = {}
+    for r in sql("SELECT farm_id, COUNT(*) AS n FROM fw_logs WHERE date >= $1 GROUP BY farm_id", (d30,)):
+        if int(r["farm_id"]) in farm_user:
+            lc[farm_user[int(r["farm_id"])]] = lc.get(farm_user[int(r["farm_id"])], 0) + int(r["n"])
+    cc = {int(r["user_id"]): int(r["n"]) for r in sql("SELECT user_id, COUNT(*) AS n FROM fw_chats WHERE created >= $1 GROUP BY user_id", (week,))}
     out = []
     for u in users:
         f = fm.get(int(u["id"]))
         out.append({"id": int(u["id"]), "email": u["email"], "name": u["name"] or "", "created": u["created"] or "",
                     "plan": u.get("plan") or "trial", "disabled": str(u.get("disabled") or "0") in ("1", "True", "true"),
-                    "lastSeen": u.get("last_seen") or "", "farms": int(f["n"]) if f else 0, "ha": round(_f(f["ha"]) or 0, 1) if f else 0})
+                    "lastSeen": u.get("last_seen") or "", "farms": int(f["n"]) if f else 0, "ha": round(_f(f["ha"]) or 0, 1) if f else 0,
+                    "logs30": lc.get(int(u["id"]), 0), "ai7": cc.get(int(u["id"]), 0),
+                    "activity": ("invited" if not u.get("last_seen") else "active" if u["last_seen"][:10] >= week else "quiet" if u["last_seen"][:10] >= d30 else "inactive")})
     return {"accounts": out,
-            "summary": {"total": len(out), "active": sum(1 for a in out if a["plan"] == "active"),
+            "summary": {"total": len(out), "active": sum(1 for a in out if a["plan"] in PAID_PLANS), "alumni": sum(1 for a in out if a["plan"] == "alumni"),
+                        "activeWeek": sum(1 for a in out if a["activity"] == "active"), "invited": sum(1 for a in out if a["activity"] == "invited"),
                         "trial": sum(1 for a in out if a["plan"] == "trial"), "newWeek": sum(1 for a in out if (a["created"] or "") >= week)},
             "payments": {"stripe": STRIPE_PAYMENT_LINK.startswith("https://"), "paypal": PAYPAL_PAYMENT_LINK.startswith("https://"),
                          "webhook": bool(STRIPE_WEBHOOK_SECRET)}}
@@ -3184,6 +3223,128 @@ def aqas_selfcheck():
     return {"checks": rows, "summary": "%d passed, %d to review, %d failing." % (n("ok"), n("warn"), n("fail"))}
 
 
+ALUMNI_SLOTS = 10
+INVITE_TTL_S = 7 * 86400
+_ASK = {}
+CORS_GET = {"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=300"}
+CORS_POST = {"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"}
+
+
+def aqas_create_client(email, name, plan, base_url, send=False):
+    """The owner adds a client. The client gets a private link to choose their own password."""
+    email = (email or "").strip().lower()
+    if not EMAIL_RE.match(email) or len(email) > 200:
+        raise ValueError("Enter a valid email address.")
+    plan = plan if plan in PLANS else "trial"
+    if sql("SELECT id FROM fw_users WHERE email=$1", (email,)):
+        raise ValueError("There is already an account with that email.")
+    rows = sql("INSERT INTO fw_users (email, name, pw_hash, created, plan) VALUES ($1,$2,$3,$4,$5) RETURNING id",
+               (email, (name or "").strip()[:80], hash_pw(secrets.token_urlsafe(24)), date.today().isoformat(), plan))
+    uid = int(rows[0]["id"])
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=INVITE_TTL_S)).isoformat(timespec="seconds")
+    sql("INSERT INTO fw_resets (token_hash, user_id, expires) VALUES ($1,$2,$3)", (_hash_token(token), uid, expires))
+    link = "%s/?reset=%s" % (base_url, token)
+    emailed = False
+    if send and os.environ.get("SMTP_HOST"):
+        try:
+            send_mail(email, "Your Farm Watch account is ready",
+                      "Hello%s,\n\nYour Farm Watch account is ready. Open this link within 7 days to choose your password and see your fields:\n%s\n\n"
+                      "To keep it on your phone, open the link in Safari, then tap Share and Add to Home Screen.\n" % ((" " + name) if name else "", link))
+            emailed = True
+        except Exception:
+            emailed = False
+    return {"id": uid, "link": link, "emailed": emailed}
+
+
+def aqas_add_farm(user_id, name, crop, geometry):
+    if not sql("SELECT id FROM fw_users WHERE id=$1", (user_id,)):
+        raise ValueError("Client not found.")
+    fid, ha = insert_farm(user_id, name or "Field", crop, geometry)
+    return {"id": fid, "areaHa": ha}
+
+
+def aqas_fields():
+    """Every client's fields on one list, driest first."""
+    ensure_schema()
+    farms = sql("SELECT id, name, crop, area_ha, user_id FROM fw_farms ORDER BY id DESC LIMIT 1000")
+    users = {int(u["id"]): u for u in sql("SELECT id, email, name FROM fw_users")}
+    cutoff = (date.today() - timedelta(days=60)).isoformat()
+    last = {}
+    for r in sql("SELECT farm_id, date, ndmi FROM fw_readings WHERE date >= $1 ORDER BY date", (cutoff,)):
+        last[int(r["farm_id"])] = r
+    out = []
+    for f in farms:
+        r, u = last.get(int(f["id"])), users.get(int(f["user_id"]), {})
+        out.append({"id": int(f["id"]), "name": f["name"], "crop": f.get("crop") or "", "ha": round(_f(f["area_ha"]) or 0, 1),
+                    "client": u.get("name") or u.get("email") or "", "email": u.get("email") or "",
+                    "status": status_of(_f(r["ndmi"])) if r else "no reading yet", "ndmi": round(_f(r["ndmi"]), 2) if r else None,
+                    "lastReading": r["date"] if r else "", "ageDays": (date.today() - date.fromisoformat(r["date"])).days if r else None})
+    order = {"Dry": 0, "Watch": 1, "no reading yet": 2, "Moist": 3}
+    out.sort(key=lambda x: (order.get(x["status"], 4), -(x["ageDays"] or 0)))
+    return {"fields": out, "summary": {"fields": len(out), "ha": round(sum(x["ha"] for x in out), 1),
+                                        "dry": sum(1 for x in out if x["status"] == "Dry"), "watch": sum(1 for x in out if x["status"] == "Watch"),
+                                        "stale": sum(1 for x in out if x["ageDays"] is not None and x["ageDays"] > 14),
+                                        "noData": sum(1 for x in out if x["status"] == "no reading yet")}}
+
+
+def public_stats():
+    ensure_schema()
+    r = sql("SELECT COUNT(*) AS n, SUM(area_ha) AS ha FROM fw_farms")[0]
+    alumni = int(sql("SELECT COUNT(*) AS n FROM fw_users WHERE plan=$1", ("alumni",))[0]["n"])
+    ha = _f(r["ha"]) or 0
+    return {"fields": int(r["n"]), "hectares": round(ha), "acres": round(ha * 2.47105),
+            "alumniTotal": ALUMNI_SLOTS, "alumniLeft": max(0, ALUMNI_SLOTS - alumni)}
+
+
+def submit_question(ip, name, email, message):
+    now = time.time()
+    recent = [x for x in _ASK.get(ip, []) if now - x < 3600]
+    if len(recent) >= 5:
+        raise ValueError("Please try again later.")
+    message, email = (message or "").strip(), (email or "").strip().lower()
+    if len(message) < 5 or len(message) > 1500:
+        raise ValueError("Write a question between 5 and 1500 characters.")
+    if email and not EMAIL_RE.match(email):
+        raise ValueError("Enter a valid email address, or leave it blank.")
+    _ASK[ip] = recent + [now]
+    ensure_schema()
+    sql("INSERT INTO fw_questions (name, email, message, created) VALUES ($1,$2,$3,$4)",
+        ((name or "").strip()[:80], email, message, datetime.now(timezone.utc).isoformat(timespec="seconds")))
+
+
+def public_faq():
+    ensure_schema()
+    return {"items": [{"q": r["message"], "a": r["reply"]} for r in sql(
+        "SELECT message, reply FROM fw_questions WHERE public=1 AND reply IS NOT NULL ORDER BY id DESC LIMIT 20")]}
+
+
+def aqas_questions():
+    ensure_schema()
+    return {"questions": [{"id": int(r["id"]), "name": r["name"] or "", "email": r["email"] or "", "message": r["message"], "created": r["created"],
+                           "reply": r["reply"] or "", "public": str(r.get("public") or "0") in ("1", "True", "true")}
+                          for r in sql("SELECT id, name, email, message, created, reply, public FROM fw_questions ORDER BY id DESC LIMIT 200")]}
+
+
+def aqas_reply(qid, reply, public):
+    reply = (reply or "").strip()
+    if not 1 <= len(reply) <= 3000:
+        raise ValueError("Write a reply of up to 3000 characters.")
+    rows = sql("SELECT email, message FROM fw_questions WHERE id=$1", (qid,))
+    if not rows:
+        raise ValueError("Question not found.")
+    sql("UPDATE fw_questions SET reply=$1, replied=$2, public=$3 WHERE id=$4",
+        (reply, datetime.now(timezone.utc).isoformat(timespec="seconds"), 1 if public else 0, qid))
+    emailed = False
+    if rows[0]["email"] and os.environ.get("SMTP_HOST"):
+        try:
+            send_mail(rows[0]["email"], "Your Farm Watch question", "You asked:\n%s\n\nOur answer:\n%s\n" % (rows[0]["message"], reply))
+            emailed = True
+        except Exception:
+            pass
+    return {"emailed": emailed}
+
+
 class handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json", extra=None):
         if not isinstance(body, bytes):
@@ -3276,6 +3437,10 @@ class handler(BaseHTTPRequestHandler):
                 return self._send(200, APP_HTML.encode("utf-8"), "text/html; charset=utf-8", {"Cache-Control": "no-cache"})
             if urlparse(self.path).path.endswith("/robots.txt"):
                 return self._send(200, b"User-agent: *\nAllow: /\nDisallow: /?r=aqas\nDisallow: /api/\n", "text/plain; charset=utf-8", {"Cache-Control": "public, max-age=86400"})
+            if r == "public-stats":
+                return self._send(200, public_stats(), extra=CORS_GET)
+            if r == "public-faq":
+                return self._send(200, public_faq(), extra=CORS_GET)
             if r in ("terms", "privacy"):
                 return self._send(200, legal_page(r), "text/html; charset=utf-8", {"Cache-Control": "public, max-age=3600"})
             if r == "icon":
@@ -3286,7 +3451,7 @@ class handler(BaseHTTPRequestHandler):
                 return self._send(200, AQAS_HTML.encode("utf-8"), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
             if r == "health":
                 return self._json(200, {"ok": True, "aqas": "phase-1-simulated"})
-            if r in ("aqas-status", "aqas-events", "aqas-proposals", "aqas-health", "aqas-accounts", "aqas-selfcheck"):
+            if r in ("aqas-status", "aqas-events", "aqas-proposals", "aqas-health", "aqas-accounts", "aqas-selfcheck", "aqas-fields", "aqas-questions"):
                 if not self._aqas_gate():
                     return
                 if r == "aqas-health":
@@ -3295,6 +3460,10 @@ class handler(BaseHTTPRequestHandler):
                     return self._json(200, aqas_accounts())
                 if r == "aqas-selfcheck":
                     return self._json(200, aqas_selfcheck())
+                if r == "aqas-fields":
+                    return self._json(200, aqas_fields())
+                if r == "aqas-questions":
+                    return self._json(200, aqas_questions())
                 snap = aqas_snapshot()
                 if r == "aqas-events":
                     return self._json(200, {"events": snap["events"]})
@@ -3359,6 +3528,15 @@ class handler(BaseHTTPRequestHandler):
                 data = self._read_json(1_600_000)
                 return self._json(200, ask_advisor(user, int(data.get("farmId") or 0), data.get("question"),
                                                    data.get("image"), data.get("mediaType") or "image/jpeg"))
+            if r == "ask-us":
+                try:
+                    raw = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 20000))
+                    d = json.loads(raw.decode("utf-8") or "{}")
+                    ip = (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+                    submit_question(ip, d.get("name"), d.get("email"), d.get("message"))
+                    return self._send(200, {"ok": True}, extra=CORS_POST)
+                except (ValueError, KeyError) as ex:
+                    return self._send(400, {"error": str(ex) or "Could not send."}, extra=CORS_POST)
             if r == "stripe-webhook":
                 if not STRIPE_WEBHOOK_SECRET:
                     return self._json(503, {"error": "Stripe webhook is not configured."})
@@ -3395,6 +3573,18 @@ class handler(BaseHTTPRequestHandler):
                     return
                 ensure_aqas_schema()
                 actor = "control-room-admin"
+                if r == "aqas-create-client":
+                    res = aqas_create_client(data.get("email"), data.get("name"), data.get("plan") or "trial", self._base_url(), bool(data.get("send")))
+                    aqas_event(actor, "client_created", (data.get("email") or "")[:120])
+                    return self._json(200, res)
+                if r == "aqas-add-farm":
+                    res = aqas_add_farm(int(data.get("userId") or 0), data.get("name"), data.get("crop"), data.get("geometry"))
+                    aqas_event(actor, "field_added", "field %d for client %d" % (res["id"], int(data.get("userId") or 0)))
+                    return self._json(200, res)
+                if r == "aqas-reply":
+                    res = aqas_reply(int(data.get("id") or 0), data.get("reply"), bool(data.get("public")))
+                    aqas_event(actor, "question_answered", "question %d" % int(data.get("id") or 0))
+                    return self._json(200, dict(res, ok=True))
                 if r == "aqas-account":
                     msg = aqas_set_account(int(data.get("id") or 0), data.get("plan"), data.get("disabled"))
                     aqas_event(actor, "account_update", msg)
