@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Farm Watch by A1 AI · Satellite irrigation intelligence, managed for you</title>
+<meta name="description" content="A1 AI monitors every field with Sentinel-2 satellite data, weather and AI, and gives you one clear daily irrigation plan. You stay in control. Book an alumni spot.">
+<meta name="theme-color" content="#052a1b">
+<meta property="og:type" content="website"><meta property="og:title" content="Farm Watch by A1 AI"><meta property="og:description" content="Know exactly when, where and how much to irrigate. Managed for you, controlled by you.">
+<link rel="icon" href="?r=icon" type="image/svg+xml">
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#f5f9f6;--panel:#fff;--ink:#0b2218;--mute:#53695e;--line:#dbe7e0;--g1:#052a1b;--g2:#0f7b5c;--g3:#7bd88f;--sh:0 10px 34px rgba(8,60,40,.10)}
+@media (prefers-color-scheme:dark){:root{--bg:#06120c;--panel:#0f2018;--ink:#eaf6ef;--mute:#9bb4a8;--line:#1f372c;--sh:0 10px 34px rgba(0,0,0,.4)}}
+html{scroll-behavior:smooth;scroll-padding-top:70px}*,*:before,*:after{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}:focus-visible{outline:3px solid var(--g3);outline-offset:3px;border-radius:6px}
+.skip{position:absolute;left:-999px;top:8px;background:var(--g2);color:#fff;padding:10px 16px;border-radius:10px;z-index:50}.skip:focus{left:12px}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+.w{max-width:1120px;margin:0 auto;padding:0 20px}
+nav{position:sticky;top:0;z-index:20;backdrop-filter:blur(14px);background:color-mix(in srgb,var(--bg) 82%,transparent);border-bottom:1px solid var(--line)}
+nav .w{display:flex;align-items:center;justify-content:space-between;height:62px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.02em;font-size:19px}.mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(140deg,#c9f7a1,#2fc686);display:grid;place-items:center;font-size:16px;font-weight:800;color:#06301f}
+.links{display:flex;gap:20px;align-items:center;font-size:14px;font-weight:600;color:var(--mute)}
+.btn{display:inline-block;font:inherit;font-weight:700;font-size:15px;padding:13px 22px;border-radius:13px;background:linear-gradient(135deg,var(--g2),#18ad73);color:#fff;border:0;cursor:pointer;box-shadow:0 8px 22px rgba(15,123,92,.35)}
+.btn.ghost{background:transparent;color:#fff;border:1.5px solid rgba(255,255,255,.5);box-shadow:none}.btn.sm{padding:9px 16px;font-size:14px}.btn[disabled]{opacity:.6}
+@media(max-width:760px){.links a.hide{display:none}.links{gap:12px}}
+.hero{position:relative;overflow:hidden;color:#fff;background:radial-gradient(900px 500px at 85% -10%,rgba(80,220,150,.38),transparent 65%),linear-gradient(135deg,var(--g1),#0a5a42 65%,#118a66)}
+.hero .w{display:grid;grid-template-columns:1.08fr .92fr;gap:40px;align-items:center;padding-top:76px;padding-bottom:70px}
+@media(max-width:860px){.hero .w{grid-template-columns:1fr;padding-top:50px;padding-bottom:50px}}
+.tag{display:inline-block;font-size:12px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:var(--g3);border:1px solid rgba(123,216,143,.4);border-radius:99px;padding:6px 13px;margin-bottom:18px}
+h1{font-size:clamp(34px,5.4vw,58px);line-height:1.06;letter-spacing:-.035em;margin:0 0 18px;font-weight:850}h1 em{font-style:normal;background:linear-gradient(90deg,#c9f7a1,#5fe0a8);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{font-size:clamp(17px,2.2vw,20px);opacity:.92;max-width:540px;margin:0 0 26px}.cta{display:flex;gap:12px;flex-wrap:wrap}
+.mock{background:var(--panel);color:var(--ink);border-radius:22px;padding:18px;box-shadow:0 30px 70px rgba(0,0,0,.35)}
+.mock .top{display:flex;justify-content:space-between;align-items:center;font-weight:800;margin-bottom:12px}.chip{font-size:12px;font-weight:800;padding:4px 10px;border-radius:99px;background:rgba(224,83,60,.14);color:#c4402b}
+.field{height:130px;border-radius:14px;position:relative;overflow:hidden;background:linear-gradient(120deg,#2f9bd8 0%,#5fc59d 38%,#f0d24b 66%,#e0533c 100%)}
+.field i{position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0 23px,rgba(255,255,255,.28) 23px 24px),repeating-linear-gradient(0deg,transparent 0 23px,rgba(255,255,255,.28) 23px 24px)}
+.field span{position:absolute;right:10px;bottom:8px;font-size:11px;font-weight:800;background:rgba(0,0,0,.55);color:#fff;border-radius:8px;padding:3px 8px}
+.adv{margin-top:12px;border-left:5px solid var(--g2);background:rgba(15,123,92,.09);border-radius:12px;padding:10px 14px}.adv b{display:block;font-size:17px}.adv small{color:var(--mute)}
+.live{background:var(--g1);color:#fff}.live .w{display:flex;gap:26px;flex-wrap:wrap;justify-content:center;padding-top:14px;padding-bottom:14px;font-size:15px}.live b{color:var(--g3);font-size:18px}
+section{padding:74px 0}.band{background:var(--panel);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.eyebrow{font-size:12px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:var(--g2)}h2{font-size:clamp(28px,4vw,42px);line-height:1.12;letter-spacing:-.03em;margin:8px 0 12px;font-weight:850}
+.sub{color:var(--mute);max-width:680px;font-size:18px;margin:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:18px;margin-top:36px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:24px;box-shadow:var(--sh)}.ico{width:48px;height:48px;border-radius:14px;display:grid;place-items:center;font-size:24px;margin-bottom:14px;background:linear-gradient(140deg,rgba(15,123,92,.16),rgba(47,155,216,.14))}
+.card h3{margin:0 0 6px;font-size:18px}.card p{margin:0;color:var(--mute);font-size:15px}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;margin-top:36px;counter-reset:s}
+.step{padding:26px 24px;border-radius:20px;background:linear-gradient(160deg,var(--g1),#0a5a42);color:#fff}.step:before{counter-increment:s;content:counter(s);display:grid;place-items:center;width:36px;height:36px;border-radius:50%;background:var(--g3);color:var(--g1);font-weight:850;margin-bottom:12px}.step h3{margin:0 0 6px}.step p{margin:0;opacity:.88;font-size:15px}
+.price{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px;margin-top:36px;align-items:stretch}
+.plan{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:22px;padding:28px 24px;box-shadow:var(--sh);display:flex;flex-direction:column}
+.plan.hot{border:2px solid var(--g2);box-shadow:0 18px 50px rgba(15,123,92,.22)}.badge{position:absolute;top:-13px;left:24px;background:linear-gradient(135deg,var(--g2),#18ad73);color:#fff;font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;border-radius:99px;padding:5px 12px}
+.plan h3{margin:0;font-size:20px}.amt{font-size:36px;font-weight:850;letter-spacing:-.03em;margin:10px 0 2px}.amt small{font-size:15px;font-weight:600;color:var(--mute)}.plan ul{margin:14px 0 22px;padding-left:20px;color:var(--mute);flex:1}.plan li{margin:6px 0}
+.chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:26px}.cc{padding:8px 16px;border-radius:99px;background:var(--bg);border:1px solid var(--line);font-weight:650;font-size:14px}
+.faq{margin-top:28px;display:grid;gap:12px;max-width:820px}.faq details{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px 20px}.faq summary{cursor:pointer;font-weight:700;font-size:17px}.faq p{margin:10px 0 0;color:var(--mute)}.faq a{text-decoration:underline}
+form{display:grid;gap:12px;margin-top:26px;max-width:640px}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:560px){.two{grid-template-columns:1fr}}
+label{font-size:14px;font-weight:700}input,textarea,select{font:inherit;width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:var(--panel);color:var(--ink);margin-top:4px}input:focus,textarea:focus,select:focus{border-color:var(--g2);outline:0;box-shadow:0 0 0 3px rgba(15,123,92,.18)}
+.msg{font-weight:700;margin-top:6px}.msg.err{color:#c4402b}.msg.ok{color:var(--g2)}
+.final{text-align:center;color:#fff;border-radius:28px;padding:56px 24px;background:radial-gradient(600px 300px at 80% 0,rgba(80,220,150,.4),transparent 70%),linear-gradient(135deg,var(--g1),#0f7b5c)}.final h2{color:#fff}.final p{opacity:.9;max-width:560px;margin:0 auto 24px;font-size:18px}
+footer{padding:36px 0 46px;color:var(--mute);font-size:14px}footer .w{display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}footer a{text-decoration:underline}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<nav aria-label="Main"><div class="w"><a class="brand" href="#top"><span class="mark">A1</span>A1 AI</a>
+<div class="links"><a class="hide" href="#features">Features</a><a class="hide" href="#pricing">Pricing</a><a class="hide" href="#faq">FAQ</a><a class="hide" href="@@APP@@">Log in</a><a class="btn sm" href="#book">Book alumni</a></div></div></nav>
+<main id="main">
+<header class="hero" id="top"><div class="w">
+<div><span class="tag">Alumni farms now booking</span>
+<h1>Satellite irrigation intelligence, <em>managed for you.</em></h1>
+<p class="lead">A1 AI watches every field with Sentinel-2 satellite data, weather and AI, and turns it into one clear daily plan: when, where and how much to irrigate. You stay in control of your farm.</p>
+<div class="cta"><a class="btn" href="#book">Book your alumni spot</a><a class="btn ghost" href="#pricing">See pricing</a></div></div>
+<div class="mock" role="img" aria-label="Illustration of the Farm Watch dashboard with sample data"><div class="top"><span>🌽 Sample field · 14.2 ha</span><span class="chip">Irrigate today</span></div>
+<div class="field"><i></i><span>Moisture map · sample</span></div><div class="adv"><b>Irrigate now, about 22 mm</b><small>Start with the driest zones: B2, C1</small></div></div>
+</div></header>
+<div class="live" id="live" hidden><div class="w"><span id="liveFarms" hidden>Now managing <b id="nF">0</b> fields · <b id="nA">0</b> acres</span><span id="liveSpots" hidden>Alumni spots left: <b id="nS">0</b> of <b id="nT">25</b></span></div></div>
+
+<section id="features"><div class="w"><div class="eyebrow">The platform</div><h2>One daily answer for every field.</h2>
+<p class="sub">Most tools show you charts. Farm Watch tells you what to do today, in millimetres, cubic metres and pump hours.</p>
+<div class="grid">
+<div class="card"><div class="ico">💧</div><h3>Daily irrigation plan</h3><p>A water balance per field using crop, soil, irrigation method and weather, sorted driest first with farm-wide totals.</p></div>
+<div class="card"><div class="ico">🛰️</div><h3>Satellite moisture maps</h3><p>Colour-coded moisture and greenness from Copernicus Sentinel-2, with cloud and shadow filtered out.</p></div>
+<div class="card"><div class="ico">⭐</div><h3>Farm scorecard</h3><p>A 0 to 100 score with every factor and reason shown, plus your biggest opportunity.</p></div>
+<div class="card"><div class="ico">🧮</div><h3>Season water budget</h3><p>Track water used against your allowance, your pace, and when you could run out.</p></div>
+<div class="card"><div class="ico">🌦️</div><h3>Forecast and spray windows</h3><p>Seven-day outlook, heat and frost warnings, disease pressure and calm, dry days for spraying.</p></div>
+<div class="card"><div class="ico">🤖</div><h3>AI crop advisor</h3><p>Ask by text or voice, or send a leaf photo. Answers use your own field data and say when to call an agronomist.</p></div>
+<div class="card"><div class="ico">📄</div><h3>Weekly field report</h3><p>A shareable report for owners, managers and agronomists, ready to print or save as a PDF.</p></div>
+<div class="card"><div class="ico">👷</div><h3>Labor and activity log</h3><p>Clock workers in and out, track piece work and cost per hectare. Consent-based, no location tracking.</p></div>
+</div></div></section>
+
+<section class="band"><div class="w"><div class="eyebrow">How it works</div><h2>Managed by us. Controlled by you.</h2>
+<div class="steps">
+<div class="step"><h3>We set up your fields</h3><p>Send us your field boundaries, or draw them yourself in minutes. We set up your account and your first plan.</p></div>
+<div class="step"><h3>We watch them every day</h3><p>Our team monitors satellite readings, weather and risks across your fields and flags what needs attention.</p></div>
+<div class="step"><h3>You make the call</h3><p>You get your own login to see every field and adjust settings, log irrigation and decide what happens on your farm.</p></div>
+</div></div></section>
+
+<section id="pricing"><div class="w"><div class="eyebrow">Pricing</div><h2>Simple, honest pricing.</h2>
+<p class="sub">Our first 25 farms become alumni and lock in their price for good. No sensors to buy.</p>
+<div class="price">
+<div class="plan hot"><span class="badge">Alumni · first 25 farms</span><h3>Alumni Farm</h3><div class="amt">$250 <small>per field</small></div>
+<ul><li>Price locked in, no increases</li><li>Full Farm Watch platform</li><li>Managed monitoring by A1 AI</li><li>Your own login and dashboard</li><li>Weekly field reports</li></ul>
+<a class="btn" href="#book">Book your alumni spot</a><p class="sub" style="font-size:14px;margin-top:10px" id="spotsLine"></p></div>
+<div class="plan"><h3>Basic</h3><div class="amt">$250 <small>onboarding</small></div><div style="font-weight:700">+ $2 <small style="font-weight:600;color:var(--mute)">per acre managed</small></div>
+<ul style="margin-top:14px"><li>Full Farm Watch platform</li><li>Managed monitoring by A1 AI</li><li>Your own login and dashboard</li><li>Weekly field reports</li></ul><a class="btn" href="#book">Get started</a></div>
+<div class="plan"><h3>Commercial</h3><div class="amt">$2,500 to $10,000 <small>flat rate</small></div><div style="color:var(--mute)">Based on the size of the farm management</div>
+<ul style="margin-top:14px"><li>Everything in Basic</li><li>Built around large or multi-farm operations</li><li>Priority support and planning</li><li>Custom reporting</li></ul><a class="btn" href="#book">Talk to us</a></div>
+</div><p class="sub" style="font-size:14px;margin-top:18px">Billing details are confirmed with you when you sign up.</p></div></section>
+
+<section class="band" id="crops"><div class="w"><div class="eyebrow">Built for cash crops</div><h2>Tuned to the crop in your field.</h2>
+<p class="sub">Each crop has its own water use, root depth and stress point, so advice for pistachios is not advice for strawberries.</p>
+<div class="chips"><span class="cc">Almonds</span><span class="cc">Pistachios</span><span class="cc">Walnuts</span><span class="cc">Corn</span><span class="cc">Cotton</span><span class="cc">Wheat</span><span class="cc">Soybeans</span><span class="cc">Peanuts</span><span class="cc">Sorghum</span><span class="cc">Potatoes</span><span class="cc">Tomatoes</span><span class="cc">Grapes</span><span class="cc">Apples</span><span class="cc">Cherries</span><span class="cc">Citrus</span><span class="cc">Avocados</span><span class="cc">Coffee</span><span class="cc">Berries</span><span class="cc">+ 40 more</span></div></div></section>
+
+<section id="faq"><div class="w"><div class="eyebrow">Questions</div><h2>Straight answers.</h2><div class="faq" id="faqList">
+<details><summary>Do I need sensors or any hardware?</summary><p>No. Farm Watch reads free Sentinel-2 satellite imagery for your field boundary and combines it with local weather.</p></details>
+<details><summary>Do I still control my farm?</summary><p>Yes. You get your own login to see every field and change settings, log irrigation and decide what happens. We monitor and advise. You decide.</p></details>
+<details><summary>How often does it update?</summary><p>Weather and advice refresh daily. A new satellite reading arrives with each clear pass, about every five days. Clouds can delay a reading, and the app shows how old the latest one is.</p></details>
+<details><summary>How accurate is the advice?</summary><p>It is an estimate from satellite data, weather, your crop, soil and irrigation method. It improves when you tell us whether it matched your field. It is guidance, so use your own judgement and local knowledge.</p></details>
+<details><summary>Which crops are supported?</summary><p>More than 60, including almonds, pistachios, corn, cotton and wheat. If yours is missing, we use sensible defaults.</p></details>
+<details><summary>What does the alumni price mean?</summary><p>The first 25 farms lock in the alumni rate. It will not go up for as long as you stay with us.</p></details>
+<details><summary>Who can see my data?</summary><p>You, and the A1 AI team who manage your account. We do not sell data or show ads. You can delete your account at any time. See the <a href="?r=privacy">Privacy Policy</a>.</p></details>
+</div></div></section>
+
+<section class="band" id="book"><div class="w"><div class="eyebrow">Book alumni</div><h2>Claim your alumni spot.</h2>
+<p class="sub">Tell us about your farm and we will contact you to get started. You can also ask us anything, and we reply personally.</p>
+<form id="bookForm"><div class="two"><div><label for="bn">Your name</label><input id="bn" required maxlength="80" autocomplete="name"></div><div><label for="be">Email</label><input id="be" type="email" required maxlength="200" autocomplete="email"></div></div>
+<div class="two"><div><label for="bp">Phone (optional)</label><input id="bp" maxlength="40" autocomplete="tel"></div><div><label for="ba">Approximate acres</label><input id="ba" maxlength="30" inputmode="numeric"></div></div>
+<div><label for="bc">Main crops</label><input id="bc" maxlength="120" placeholder="Almonds, corn, cotton…"></div>
+<div><label for="bm">Your question or message</label><textarea id="bm" rows="4" maxlength="900"></textarea></div>
+<button class="btn" id="bb" type="submit">Book alumni spot</button><div class="msg" id="bmsg" role="status"></div></form></div></section>
+
+<section><div class="w"><div class="final"><h2>Know your fields. Every day.</h2><p>Join our first alumni farms and lock in your price.</p><a class="btn" href="#book">Book your alumni spot</a></div></div></section>
+</main>
+<footer><div class="w"><span>© 2026 A1 AI. All rights reserved. · <a href="?r=terms">Terms</a> · <a href="?r=privacy">Privacy</a> · <a href="@@APP@@">Log in</a></span><span>Contains modified Copernicus Sentinel data. Weather data by Open-Meteo.com. Guidance only, not a substitute for a local agronomist.</span></div></footer>
+<script>
+(function(){
+var $=function(i){return document.getElementById(i)};
+fetch('?r=public-stats').then(function(r){return r.json()}).then(function(s){
+  var any=false;
+  if(s.fields>0){$('nF').textContent=s.fields;$('nA').textContent=s.acres.toLocaleString();$('liveFarms').hidden=false;any=true}
+  $('nS').textContent=s.alumniLeft;$('nT').textContent=s.alumniTotal;$('liveSpots').hidden=false;any=true;
+  $('spotsLine').textContent=s.alumniLeft>0?(s.alumniLeft+' of '+s.alumniTotal+' alumni spots left'):'Alumni spots are full. Basic and Commercial are open.';
+  if(any)$('live').hidden=false}).catch(function(){});
+fetch('?r=public-faq').then(function(r){return r.json()}).then(function(d){
+  (d.items||[]).forEach(function(x){var el=document.createElement('details'),s=document.createElement('summary'),p=document.createElement('p');s.textContent=x.q;p.textContent=x.a;el.appendChild(s);el.appendChild(p);$('faqList').appendChild(el)})}).catch(function(){});
+$('bookForm').addEventListener('submit',function(e){
+  e.preventDefault();var b=$('bb'),m=$('bmsg');b.disabled=true;m.className='msg';m.textContent='Sending…';
+  var msg='ALUMNI BOOKING\nPhone: '+$('bp').value+'\nAcres: '+$('ba').value+'\nCrops: '+$('bc').value+'\n\n'+$('bm').value;
+  fetch('?r=ask-us',{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({name:$('bn').value,email:$('be').value,message:msg})})
+  .then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||'Could not send.');return d})})
+  .then(function(){m.className='msg ok';m.textContent='Thank you. We received your booking and will contact you soon.';$('bookForm').reset()})
+  .catch(function(er){m.className='msg err';m.textContent=er.message})
+  .then(function(){b.disabled=false})});
+})();
+</script>
+</body>
+</html>
