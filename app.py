@@ -188,6 +188,15 @@ def ensure_schema():
                 date TEXT NOT NULL, ndmi DOUBLE PRECISION NOT NULL,
                 ndvi DOUBLE PRECISION, clear_fraction DOUBLE PRECISION,
                 PRIMARY KEY (farm_id, date))""")
+            sql("""CREATE TABLE IF NOT EXISTS fw_radar (
+                farm_id INTEGER NOT NULL REFERENCES fw_farms(id) ON DELETE CASCADE,
+                date TEXT NOT NULL, vv_db DOUBLE PRECISION, vh_db DOUBLE PRECISION,
+                PRIMARY KEY (farm_id, date))""")
+            sql("""CREATE TABLE IF NOT EXISTS fw_probe_readings (
+                farm_id INTEGER NOT NULL REFERENCES fw_farms(id) ON DELETE CASCADE,
+                probe TEXT NOT NULL, depth_cm DOUBLE PRECISION NOT NULL, date TEXT NOT NULL, vwc DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (farm_id, probe, depth_cm, date))""")
+            sql("ALTER TABLE fw_farms ADD COLUMN IF NOT EXISTS probe_key TEXT")
             sql("""CREATE TABLE IF NOT EXISTS fw_forecasts (
                 farm_id INTEGER PRIMARY KEY REFERENCES fw_farms(id) ON DELETE CASCADE,
                 fetched TEXT NOT NULL, data TEXT NOT NULL)""")
@@ -1074,7 +1083,7 @@ def build_budget(views):
     return {"items": items, "totalAppliedM3": used, "totalBudgetM3": allow, "totalPct": round(used / allow * 100) if allow else 0}
 
 
-def farm_view(f, readings, days, logs=(), feedback=(), zone_rows=(), now=None, map_meta=None, irr_logs=None):
+def farm_view(f, readings, days, logs=(), feedback=(), zone_rows=(), now=None, map_meta=None, irr_logs=None, radar_rows=None, probe_rows=None):
     last = readings[-1] if readings else None
     status = status_of(last["ndmi"]) if last else None
     fut = days[-7:] if days else days
@@ -1090,6 +1099,7 @@ def farm_view(f, readings, days, logs=(), feedback=(), zone_rows=(), now=None, m
             "soil": f.get("soil") or "", "irrigation": f.get("irrigation") or "", "flow": _f(f.get("flow_m3h")),
             "now": now, "budgetMm": _f(f.get("budget_mm")), "seasonStart": f.get("season_start") or "", "seasonEnd": f.get("season_end") or "",
             "budget": water_budget(f, irr_logs or [], date.today(), advice),
+            "radar": radar_index(radar_rows or []), "probes": probe_summary(probe_rows or [], readings),
             "score": farm_score(readings, zones, list(logs), water_budget(f, irr_logs or [], date.today(), advice)),
             "map": ({"date": map_meta["date"], "bbox": json.loads(map_meta["bbox"]),
                      "url": f"/api/index?r=map&id={int(f['id'])}&v={map_meta['date']}"} if map_meta else None),
@@ -1279,6 +1289,12 @@ def farms_payload(user_id):
     for fb in sql("SELECT farm_id, date, verdict FROM fw_feedback WHERE date >= $2 AND farm_id IN "
                   "(SELECT id FROM fw_farms WHERE user_id=$1) ORDER BY date DESC, id DESC", (user_id, since)):
         fb_by.setdefault(int(fb["farm_id"]), []).append({"date": fb["date"], "verdict": fb["verdict"]})
+    radar_by, probe_by = {}, {}
+    pcut = (date.today() - timedelta(days=150)).isoformat()
+    for r in sql("SELECT farm_id, date, vv_db FROM fw_radar WHERE farm_id IN (SELECT id FROM fw_farms WHERE user_id=$1) ORDER BY date", (user_id,)):
+        radar_by.setdefault(int(r["farm_id"]), []).append(r)
+    for r in sql("SELECT farm_id, probe, depth_cm, date, vwc FROM fw_probe_readings WHERE date >= $2 AND farm_id IN (SELECT id FROM fw_farms WHERE user_id=$1) ORDER BY date", (user_id, pcut)):
+        probe_by.setdefault(int(r["farm_id"]), []).append(r)
     irr_by = {}
     for lg in sql("SELECT farm_id, amount, date FROM fw_logs WHERE kind=$2 AND farm_id IN (SELECT id FROM fw_farms WHERE user_id=$1)", (user_id, "irrigation")):
         irr_by.setdefault(int(lg["farm_id"]), []).append({"amount": _f(lg["amount"]), "date": lg["date"]})
@@ -1294,7 +1310,8 @@ def farms_payload(user_id):
         "SELECT farm_id, date, bbox FROM fw_maps WHERE kind=$2 AND farm_id IN (SELECT id FROM fw_farms WHERE user_id=$1)",
         (user_id, "ndmi"))}
     views = [farm_view(f, by.get(int(f["id"]), []), w[0], logs_by.get(int(f["id"]), []), fb_by.get(int(f["id"]), []),
-                       zr_by.get(int(f["id"]), []), w[1], maps.get(int(f["id"])), irr_by.get(int(f["id"]), []))
+                       zr_by.get(int(f["id"]), []), w[1], maps.get(int(f["id"])), irr_by.get(int(f["id"]), []),
+                       radar_by.get(int(f["id"]), []), probe_by.get(int(f["id"]), []))
              for f, w in zip(farms, weather)]
     acc = accuracy_stats([x["verdict"] for x in sql("SELECT verdict FROM fw_feedback WHERE farm_id IN (SELECT id FROM fw_farms WHERE user_id=$1)", (user_id,))])
     return {"farms": views, "accuracy": acc, "briefing": build_briefing(views), "plan": build_plan(views), "waterBudget": build_budget(views),
@@ -1474,6 +1491,9 @@ def fetch_all(user_id=None):
     map_have = {int(r["farm_id"]): r["date"] for r in sql(
         f"SELECT farm_id, date FROM fw_maps WHERE kind='ndmi' AND farm_id IN ({ids})")}
 
+    radar_have = {int(r["farm_id"]): r["d"] for r in sql(
+        f"SELECT farm_id, MAX(date) AS d FROM fw_radar WHERE farm_id IN ({ids}) GROUP BY farm_id")} if ENABLE_RADAR else {}
+
     def work(farm):
         name, fid = farm["name"], int(farm["id"])
         try:
@@ -1517,6 +1537,21 @@ def fetch_all(user_id=None):
                         msgs.append("updated the moisture map")
                 except Exception as e:
                     msgs.append(f"map failed ({e})")
+            if ENABLE_RADAR:
+                try:
+                    rl = radar_have.get(fid)
+                    rs = date.fromisoformat(rl) + timedelta(days=1) if rl else today - timedelta(days=90)
+                    if rs <= today:
+                        rr = parse_radar(request_radar(token, json.loads(farm["geometry"]), rs, today))
+                        if rr:
+                            marks, params = [], []
+                            for i, r in enumerate(rr):
+                                marks.append("(" + ",".join(f"${i * 4 + k}" for k in range(1, 5)) + ")")
+                                params += [fid, r["date"], r["vv"], r["vh"]]
+                            sql("INSERT INTO fw_radar (farm_id, date, vv_db, vh_db) VALUES " + ",".join(marks) + " ON CONFLICT DO NOTHING", params)
+                            msgs.append(f"radar: {len(rr)} new pass(es)")
+                except Exception as e:  # radar is an extra. It must never break the main update.
+                    msgs.append(f"radar skipped ({str(e)[:70]})")
             return f"{name}: " + ", ".join(msgs), stored_n, alert
         except Exception as e:  # one failing farm should not stop the rest
             return f"{name}: failed ({e})", 0, None
@@ -2256,7 +2291,7 @@ def aqas_log_daily(result):
         print("AQAS log failed:", e, file=sys.stderr)
 
 
-AQAS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AQAS Pro Control Room</title><style>:root{color-scheme:dark;--line:#26364f;--muted:#a8b7cc;--text:#f4f7fb;--accent:#7dd3fc;--amber:#fcd34d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#162846,#0a1020 60%);color:var(--text);font:15px system-ui,sans-serif}.wrap{max-width:1150px;margin:auto;padding:28px 18px 60px}.top,.sectionhead{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.brand{font-size:12px;letter-spacing:.2em;color:var(--accent);font-weight:800}.subtitle,.muted{color:var(--muted);font-size:13px}.badge,.status{border:1px solid #806b2e;color:var(--amber);border-radius:99px;padding:7px 11px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:24px 0}.card,section{background:rgba(17,27,46,.94);border:1px solid var(--line);border-radius:16px;padding:18px}.notice{background:#172a40;border:1px solid #31506c;padding:12px;border-radius:10px;margin:14px 0}.tokenbox,.row{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.tokenbox input{flex:1;min-width:220px}.proposal,.event{border-top:1px solid var(--line);padding:14px 0}.risk{font-size:11px;text-transform:uppercase;color:var(--amber)}.risk.high{color:#fca5a5}.risk.low{color:#86efac}button,input,textarea,select{font:inherit;border-radius:9px;border:1px solid #344761;padding:10px;background:#0b1425;color:var(--text)}button{cursor:pointer;background:#173c59;border-color:#2b6c91}button.secondary{background:#1c293d}button.danger{background:#51272c}input,select,textarea{width:100%}textarea{min-height:70px}label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.wide{grid-column:1/-1}.empty{color:var(--muted);padding:16px 0}@media(max-width:600px){.formgrid{grid-template-columns:1fr}.wide{grid-column:auto}}</style></head><body><div class="wrap"><div class="top"><div><div class="brand">AQAS PRO / CONTROL ROOM</div><h1 style="margin:7px 0 0">FarmWatch Operations</h1><div class="subtitle">Supervisor foundation · auditable · human-approved</div></div><span class="badge">SIMULATION MODE · NO LIVE AGENT ACTIONS</span></div><div class="notice">Phase 1 is intentionally safe: agents are paused and simulated. Approving a proposal records the decision only; it does not change production systems or send outreach.</div><div class="tokenbox"><input id="token" type="password" autocomplete="off" placeholder="AQAS_ADMIN_TOKEN (not your OpenAI key)"><button onclick="saveToken()">Connect control room</button><button class="secondary" onclick="refresh()">Refresh</button></div><div id="message" class="muted">Set AQAS_ADMIN_TOKEN in Render, then enter the same value here.</div><div id="agents" class="grid"></div><section><div class="sectionhead"><h2>Farm Watch health</h2><span class="muted">Live counts from the running system</span></div><div id="health" class="grid"></div></section><section><div class="sectionhead"><h2>Go-live check</h2><span class="muted">Tests every connected service</span></div><button id="chkbtn" type="button" onclick="runCheck()">Run check</button><div id="chk"></div></section><section><div class="sectionhead"><h2>Add a client</h2><span class="muted">They choose their own password</span></div><div class="card"><input id="nc_name" placeholder="Client name"> <input id="nc_email" type="email" placeholder="Client email"> <select id="nc_plan"><option value="alumni">alumni</option><option value="basic">basic</option><option value="commercial">commercial</option><option value="trial">trial</option></select> <label><input id="nc_send" type="checkbox"> email the invite</label> <button type="button" onclick="newClient()">Create client</button><div id="nc_out" class="muted" style="margin-top:8px"></div></div></section><section><div class="sectionhead"><h2>Clients</h2><span class="muted">Usage only. Clients control their own farming</span></div><div id="accts" class="empty">Connect to load clients.</div></section><section><div class="sectionhead"><h2>All fields</h2><span class="muted">Every client, driest first</span></div><div id="fields" class="empty">Connect to load fields.</div></section><section><div class="sectionhead"><h2>Questions</h2><span class="muted">From your website</span></div><div id="qs" class="empty">Connect to load questions.</div></section><section><div class="sectionhead"><h2>Proposal queue</h2><span class="muted">All behavior changes require approval</span></div><div id="proposals" class="empty">Connect to load proposals.</div></section><section style="margin-top:16px"><div class="sectionhead"><h2>Create a proposal</h2><span class="muted">No direct execution</span></div><form id="proposalForm"><div class="formgrid"><div><label>Agent</label><select id="agent"><option>ARAIAH</option><option>Pluto</option><option>Orion</option><option>AQAS</option></select></div><div><label>Risk level</label><select id="risk"><option>low</option><option>medium</option><option>high</option></select></div><div class="wide"><label>Proposal title</label><input id="title" required maxlength="180"></div><div class="wide"><label>Reason / evidence</label><textarea id="rationale" required maxlength="2000"></textarea></div><div class="wide"><label>Expected effect</label><textarea id="effect" required maxlength="1000"></textarea></div><div class="wide"><label>Proposed change (plain-language description)</label><textarea id="change" maxlength="2000"></textarea></div></div><div class="row"><button type="submit">Submit for review</button></div></form></section><section style="margin-top:16px"><div class="sectionhead"><h2>Audit trail</h2><span class="muted">Most recent 50 events</span></div><div id="events" class="empty">Connect to load events.</div></section></div><script>const $=id=>document.getElementById(id);function token(){return sessionStorage.getItem('aqas_admin_token')||''}function saveToken(){sessionStorage.setItem('aqas_admin_token',$('token').value.trim());refresh()}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function api(r,method='GET',body){const res=await fetch('?r='+encodeURIComponent(r),{method,headers:{'Authorization':'Bearer '+token(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store'});let d={};try{d=await res.json()}catch{}if(!res.ok)throw Error(d.error||'Request failed ('+res.status+')');return d}async function refresh(){if($('token').value)sessionStorage.setItem('aqas_admin_token',$('token').value.trim());$('message').textContent='Connecting…';try{const d=await api('aqas-status');loadAccts();loadFields();loadQs();try{const h=await api('aqas-health');$('health').innerHTML=h.cards.map(c=>`<div class="card"><div class="muted">${esc(c.label)}</div><h2 style="margin:6px 0 0">${esc(c.value)}</h2><div class="muted">${esc(c.note||'')}</div></div>`).join('')}catch(e){$('health').innerHTML=''}$('message').textContent='Connected · OpenAI key '+(d.openaiConfigured?'configured':'not configured')+' · live agent actions disabled';$('agents').innerHTML=d.agents.map(a=>`<div class="card"><div class="sectionhead"><h3>${esc(a.agent)}</h3><span class="status">${esc(a.status)}</span></div><div class="muted">${esc((a.metrics||{}).description||'Specialist agent')}</div><p>Mode: <b>${esc(a.mode)}</b></p><p>Daily contact cap: <b>${esc(a.daily_cap)}</b></p><div class="row"><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','paused')">Pause</button><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','simulated')">Set simulated</button></div></div>`).join('');$('proposals').innerHTML=d.pendingProposals.length?d.pendingProposals.map(p=>`<div class="proposal"><div class="sectionhead"><h3>${esc(p.title)}</h3><span class="risk ${esc(p.risk)}">${esc(p.risk)} risk</span></div><div class="muted">${esc(p.agent)} · ${esc(p.created_at)}</div><p>${esc(p.rationale)}</p><p><b>Expected effect:</b> ${esc(p.expected_effect)}</p><p class="muted">Proposed change: ${esc(JSON.stringify(p.proposed_change))}</p><div class="row"><button onclick="decide(${p.id},'approved')">Approve record</button><button class="danger" onclick="decide(${p.id},'rejected')">Reject</button></div></div>`).join(''):'<div class="empty">No pending proposals.</div>';$('events').innerHTML=d.events.length?d.events.map(e=>`<div class="event"><div class="muted">${esc(e.occurred_at)} · ${esc(e.actor)} · ${esc(e.event_type)} ${e.agent?'· '+esc(e.agent):''}</div><div>${esc(e.summary)}</div></div>`).join(''):'<div class="empty">No events yet.</div>'}catch(e){$('message').textContent=e.message;$('agents').innerHTML='';$('proposals').innerHTML='<div class="empty">Not connected.</div>'}}function ringOf(coords){var r=coords.map(function(c){return [c[1],c[0]]});if(r.length>1&&r[0][0]===r[r.length-1][0]&&r[0][1]===r[r.length-1][1])r.pop();return r}
+AQAS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AQAS Pro Control Room</title><style>:root{color-scheme:dark;--line:#26364f;--muted:#a8b7cc;--text:#f4f7fb;--accent:#7dd3fc;--amber:#fcd34d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#162846,#0a1020 60%);color:var(--text);font:15px system-ui,sans-serif}.wrap{max-width:1150px;margin:auto;padding:28px 18px 60px}.top,.sectionhead{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.brand{font-size:12px;letter-spacing:.2em;color:var(--accent);font-weight:800}.subtitle,.muted{color:var(--muted);font-size:13px}.badge,.status{border:1px solid #806b2e;color:var(--amber);border-radius:99px;padding:7px 11px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:24px 0}.card,section{background:rgba(17,27,46,.94);border:1px solid var(--line);border-radius:16px;padding:18px}.notice{background:#172a40;border:1px solid #31506c;padding:12px;border-radius:10px;margin:14px 0}.tokenbox,.row{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.tokenbox input{flex:1;min-width:220px}.proposal,.event{border-top:1px solid var(--line);padding:14px 0}.risk{font-size:11px;text-transform:uppercase;color:var(--amber)}.risk.high{color:#fca5a5}.risk.low{color:#86efac}button,input,textarea,select{font:inherit;border-radius:9px;border:1px solid #344761;padding:10px;background:#0b1425;color:var(--text)}button{cursor:pointer;background:#173c59;border-color:#2b6c91}button.secondary{background:#1c293d}button.danger{background:#51272c}input,select,textarea{width:100%}textarea{min-height:70px}label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.wide{grid-column:1/-1}.empty{color:var(--muted);padding:16px 0}@media(max-width:600px){.formgrid{grid-template-columns:1fr}.wide{grid-column:auto}}</style></head><body><div class="wrap"><div class="top"><div><div class="brand">AQAS PRO / CONTROL ROOM</div><h1 style="margin:7px 0 0">FarmWatch Operations</h1><div class="subtitle">Supervisor foundation · auditable · human-approved</div></div><span class="badge">SIMULATION MODE · NO LIVE AGENT ACTIONS</span></div><div class="notice">Phase 1 is intentionally safe: agents are paused and simulated. Approving a proposal records the decision only; it does not change production systems or send outreach.</div><div class="tokenbox"><input id="token" type="password" autocomplete="off" placeholder="AQAS_ADMIN_TOKEN (not your OpenAI key)"><button onclick="saveToken()">Connect control room</button><button class="secondary" onclick="refresh()">Refresh</button></div><div id="message" class="muted">Set AQAS_ADMIN_TOKEN in Render, then enter the same value here.</div><div id="agents" class="grid"></div><section><div class="sectionhead"><h2>Farm Watch health</h2><span class="muted">Live counts from the running system</span></div><div id="health" class="grid"></div></section><section><div class="sectionhead"><h2>Needs your attention</h2><span class="muted">What to act on today</span></div><div id="attn" class="empty">Connect to load.</div></section><section><div class="sectionhead"><h2>Go-live check</h2><span class="muted">Tests every connected service</span></div><button id="chkbtn" type="button" onclick="runCheck()">Run check</button><div id="chk"></div></section><section><div class="sectionhead"><h2>Add a client</h2><span class="muted">They choose their own password</span></div><div class="card"><input id="nc_name" placeholder="Client name"> <input id="nc_email" type="email" placeholder="Client email"> <select id="nc_plan"><option value="alumni">alumni</option><option value="basic">basic</option><option value="commercial">commercial</option><option value="trial">trial</option></select> <label><input id="nc_send" type="checkbox"> email the invite</label> <button type="button" onclick="newClient()">Create client</button><div id="nc_out" class="muted" style="margin-top:8px"></div></div></section><section><div class="sectionhead"><h2>Clients</h2><span class="muted">Usage only. Clients control their own farming</span></div><div id="accts" class="empty">Connect to load clients.</div></section><section><div class="sectionhead"><h2>All fields</h2><span class="muted">Every client, driest first</span></div><div id="fields" class="empty">Connect to load fields.</div></section><section><div class="sectionhead"><h2>Questions</h2><span class="muted">From your website</span></div><div id="qs" class="empty">Connect to load questions.</div></section><section><div class="sectionhead"><h2>Proposal queue</h2><span class="muted">All behavior changes require approval</span></div><div id="proposals" class="empty">Connect to load proposals.</div></section><section style="margin-top:16px"><div class="sectionhead"><h2>Create a proposal</h2><span class="muted">No direct execution</span></div><form id="proposalForm"><div class="formgrid"><div><label>Agent</label><select id="agent"><option>ARAIAH</option><option>Pluto</option><option>Orion</option><option>AQAS</option></select></div><div><label>Risk level</label><select id="risk"><option>low</option><option>medium</option><option>high</option></select></div><div class="wide"><label>Proposal title</label><input id="title" required maxlength="180"></div><div class="wide"><label>Reason / evidence</label><textarea id="rationale" required maxlength="2000"></textarea></div><div class="wide"><label>Expected effect</label><textarea id="effect" required maxlength="1000"></textarea></div><div class="wide"><label>Proposed change (plain-language description)</label><textarea id="change" maxlength="2000"></textarea></div></div><div class="row"><button type="submit">Submit for review</button></div></form></section><section style="margin-top:16px"><div class="sectionhead"><h2>Audit trail</h2><span class="muted">Most recent 50 events</span></div><div id="events" class="empty">Connect to load events.</div></section></div><script>const $=id=>document.getElementById(id);function token(){return sessionStorage.getItem('aqas_admin_token')||''}function saveToken(){sessionStorage.setItem('aqas_admin_token',$('token').value.trim());refresh()}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function api(r,method='GET',body){const res=await fetch('?r='+encodeURIComponent(r),{method,headers:{'Authorization':'Bearer '+token(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store'});let d={};try{d=await res.json()}catch{}if(!res.ok)throw Error(d.error||'Request failed ('+res.status+')');return d}async function refresh(){if($('token').value)sessionStorage.setItem('aqas_admin_token',$('token').value.trim());$('message').textContent='Connecting…';try{const d=await api('aqas-status');loadAccts();loadFields();loadQs();loadAttention();try{const h=await api('aqas-health');$('health').innerHTML=h.cards.map(c=>`<div class="card"><div class="muted">${esc(c.label)}</div><h2 style="margin:6px 0 0">${esc(c.value)}</h2><div class="muted">${esc(c.note||'')}</div></div>`).join('')}catch(e){$('health').innerHTML=''}$('message').textContent='Connected · OpenAI key '+(d.openaiConfigured?'configured':'not configured')+' · live agent actions disabled';$('agents').innerHTML=d.agents.map(a=>`<div class="card"><div class="sectionhead"><h3>${esc(a.agent)}</h3><span class="status">${esc(a.status)}</span></div><div class="muted">${esc((a.metrics||{}).description||'Specialist agent')}</div><p>Mode: <b>${esc(a.mode)}</b></p><p>Daily contact cap: <b>${esc(a.daily_cap)}</b></p><div class="row"><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','paused')">Pause</button><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','simulated')">Set simulated</button></div></div>`).join('');$('proposals').innerHTML=d.pendingProposals.length?d.pendingProposals.map(p=>`<div class="proposal"><div class="sectionhead"><h3>${esc(p.title)}</h3><span class="risk ${esc(p.risk)}">${esc(p.risk)} risk</span></div><div class="muted">${esc(p.agent)} · ${esc(p.created_at)}</div><p>${esc(p.rationale)}</p><p><b>Expected effect:</b> ${esc(p.expected_effect)}</p><p class="muted">Proposed change: ${esc(JSON.stringify(p.proposed_change))}</p><div class="row"><button onclick="decide(${p.id},'approved')">Approve record</button><button class="danger" onclick="decide(${p.id},'rejected')">Reject</button></div></div>`).join(''):'<div class="empty">No pending proposals.</div>';$('events').innerHTML=d.events.length?d.events.map(e=>`<div class="event"><div class="muted">${esc(e.occurred_at)} · ${esc(e.actor)} · ${esc(e.event_type)} ${e.agent?'· '+esc(e.agent):''}</div><div>${esc(e.summary)}</div></div>`).join(''):'<div class="empty">No events yet.</div>'}catch(e){$('message').textContent=e.message;$('agents').innerHTML='';$('proposals').innerHTML='<div class="empty">Not connected.</div>'}}function ringOf(coords){var r=coords.map(function(c){return [c[1],c[0]]});if(r.length>1&&r[0][0]===r[r.length-1][0]&&r[0][1]===r[r.length-1][1])r.pop();return r}
 function parseBoundary(text){
   var out=[],s=text.trim();
   if(s.charAt(0)==="<"){
@@ -2279,6 +2314,7 @@ function addFieldFor(uid){const i=document.createElement('input');i.type='file';
 async function loadFields(){try{const a=await api('aqas-fields'),s=a.summary,col={Dry:'#e0533c',Watch:'#f0a21b',Moist:'#2f9bd8'};$('fields').className='';$('fields').innerHTML='<p class="muted" style="margin:0 0 8px">'+s.fields+' fields · '+s.ha+' ha · '+s.dry+' dry · '+s.watch+' watch · '+s.stale+' with no fresh reading in 14 days</p>'+(a.fields.map(f=>`<div class="card" style="margin-top:8px;border-left:5px solid ${col[f.status]||'#8a9a92'}"><b>${esc(f.name)}</b> <span class="muted">${esc(f.crop)} · ${f.ha} ha</span><div class="muted">${esc(f.client)} · <b>${esc(f.status)}</b>${f.ndmi!==null?' ('+f.ndmi+')':''} · ${f.lastReading?('last reading '+esc(f.lastReading)):'no satellite reading yet'}</div></div>`).join('')||'<div class="empty">No fields yet.</div>')}catch(e){$('fields').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
 async function loadQs(){try{const a=await api('aqas-questions');$('qs').className='';$('qs').innerHTML=a.questions.map(q=>`<div class="card" style="margin-top:8px"><b>${esc(q.name||'Visitor')}</b> <span class="muted">${esc(q.email)} · ${esc(q.created.slice(0,10))}</span><p style="margin:6px 0">${esc(q.message)}</p>${q.reply?'<div class="muted">Your reply'+(q.public?' (shown on the website)':'')+': '+esc(q.reply)+'</div>':''}<textarea id="rp${q.id}" rows="2" style="width:100%" placeholder="Write a reply">${esc(q.reply)}</textarea><label><input id="rpp${q.id}" type="checkbox"${q.public?' checked':''}> show on the website FAQ</label> <button type="button" onclick="replyQ(${q.id})">Send reply</button></div>`).join('')||'<div class="empty">No questions yet.</div>'}catch(e){$('qs').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
 async function replyQ(id){try{await api('aqas-reply','POST',{id,reply:$('rp'+id).value,public:$('rpp'+id).checked});await loadQs()}catch(e){alert(e.message)}}
+async function loadAttention(){try{const a=await api('aqas-attention');const ic={high:'🔴',medium:'🟠',low:'⚪'};$('attn').className='';$('attn').innerHTML=a.items.length?a.items.map(i=>`<div class="card" style="margin-top:8px">${ic[i.level]} ${esc(i.text)}</div>`).join(''):'<div class="card">✅ Nothing needs your attention right now.</div>'}catch(e){$('attn').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
 async function runCheck(){const b=$('chkbtn');b.disabled=true;b.textContent='Checking…';try{const a=await api('aqas-selfcheck');const ic={ok:'✅',warn:'⚠️',fail:'❌'};$('chk').innerHTML='<p class="muted" style="margin:10px 0"><b>'+esc(a.summary)+'</b></p>'+a.checks.map(c=>`<div class="card" style="margin-top:8px"><b>${ic[c.status]} ${esc(c.name)}</b><div class="muted">${esc(c.detail)}</div>${c.fix?`<div style="margin-top:4px">${esc(c.fix)}</div>`:''}</div>`).join('')}catch(e){$('chk').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}b.disabled=false;b.textContent='Run check again'}async function loadAccts(){try{const a=await api('aqas-accounts');const s=a.summary,p=a.payments;$('accts').className='';$('accts').innerHTML='<div class="grid">'+[['Clients',s.total],['Paying',s.active],['Active this week',s.activeWeek],['Alumni spots left',Math.max(0,s.alumniTotal-s.alumni)]].map(x=>`<div class="card"><div class="muted">${x[0]}</div><h2 style="margin:6px 0 0">${x[1]}</h2></div>`).join('')+'</div><p class="muted" style="margin:10px 0">Payments: Stripe link '+(p.stripe?'on':'off')+' · PayPal link '+(p.paypal?'on':'off')+' · Stripe auto-update '+(p.webhook?'on':'off')+'</p>'+(a.accounts.map(u=>`<div class="card" style="margin-top:10px"><b>${esc(u.email)}</b>${u.disabled?' <span class="muted">(paused)</span>':''}<div class="muted">${esc(u.name)} · joined ${esc((u.created||'').slice(0,10))} · <b>${esc(u.activity)}</b> · last seen ${esc((u.lastSeen||'never').slice(0,10))}</div><div class="muted">${u.farms} fields, ${u.ha} ha · ${u.logs30} activity entries in 30 days · ${u.ai7} Advisor questions this week</div><div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><select onchange="setAcct(${u.id},{plan:this.value})">${['trial','alumni','basic','commercial','active','past_due','cancelled','free'].map(k=>`<option value="${k}"${k===u.plan?' selected':''}>${k}</option>`).join('')}</select><button type="button" onclick="addFieldFor(${u.id})">Add field from file</button><button type="button" onclick="setAcct(${u.id},{disabled:${u.disabled?'false':'true'}})">${u.disabled?'Resume':'Pause'} account</button></div></div>`).join('')||'<div class="empty">No accounts yet.</div>')}catch(e){$('accts').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}async function setAcct(id,body){try{await api('aqas-account','POST',Object.assign({id},body));await loadAccts()}catch(e){alert(e.message)}}async function pauseAgent(agent,status){try{await api('aqas-agent-control','POST',{agent,status});await refresh()}catch(e){alert(e.message)}}async function decide(id,status){const note=prompt('Review note (required for audit):');if(note===null)return;try{await api('aqas-decision','POST',{id,status,note});await refresh()}catch(e){alert(e.message)}}$('proposalForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('aqas-propose','POST',{agent:$('agent').value,risk:$('risk').value,title:$('title').value,rationale:$('rationale').value,expectedEffect:$('effect').value,change:$('change').value});e.target.reset();await refresh()}catch(err){alert(err.message)}});$('token').value=token();if(token())refresh();</script></body></html>
 """
 
@@ -2490,7 +2526,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0
 </div>
 <footer class="foot"><p>By using Farm Watch you agree to the <a href="?r=terms">Terms</a> and <a href="?r=privacy">Privacy Policy</a>. Guidance only, not a substitute for a local agronomist.</p><p id="installTip" class="help" hidden></p><div id="payCard" class="panel" hidden style="margin:0 0 14px"></div><p><button id="delAcct" type="button" class="b alt" hidden>Delete my account</button></p><p class="d">© 2026 A1 AI</p></footer>
 <style>.foot{max-width:760px;margin:10px auto 40px;padding:0 18px;font-size:13px;color:var(--mute)}.foot a{color:var(--wet);font-weight:600}.foot .d{opacity:.7}</style>
-<script>window.fwTip=function(e,svg){try{var s=JSON.parse(svg.getAttribute("data-s")),th=svg.getAttribute("data-th").split(","),p=+svg.getAttribute("data-p"),W=+svg.getAttribute("data-w"),r=svg.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W,i=Math.max(0,Math.min(s.length-1,Math.round((x-p)/(W-2*p)*(s.length-1)))),a=s[i],px=p+i*(W-2*p)/Math.max(1,s.length-1),st=a[1]<+th[0]?"Dry":a[1]<+th[1]?"Watch":"Moist",l=svg.querySelector(".cl");l.setAttribute("x1",px);l.setAttribute("x2",px);l.setAttribute("opacity",".5");svg.querySelector(".tt").textContent=a[0]+": moisture "+a[1].toFixed(2)+" ("+st+")"+(a[2]!=null?", greenness "+a[2].toFixed(2):"")}catch(_){}};
+<script>window.fwProbeKey=function(fid){var el=document.getElementById("pk"+fid);fetch("?r=probe-key",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({farmId:fid})}).then(function(r){return r.json()}).then(function(d){if(!d.key)throw new Error(d.error||"Could not load.");var u=location.origin+location.pathname.replace(/\/$/,"")+"/?r=probe-ingest";el.textContent="POST "+u+"\nContent-Type: application/json\n\n"+JSON.stringify({key:d.key,readings:[{probe:"Probe 1",depth:30,date:"2026-11-01",vwc:24.5}]},null,1)+"\n\nKeep the key private. Anyone with it can add readings to this field."}).catch(function(e){el.textContent=e.message})};
+window.fwParseProbeCsv=function(text){var lines=text.replace(/\r/g,"").split("\n").filter(function(l){return l.trim()});if(lines.length<2)return [];var h=lines[0].split(",").map(function(x){return x.trim().toLowerCase()});var f=function(fn){return h.findIndex(fn)};var iD=f(function(x){return x==="date"||x==="day"||x==="timestamp"||x==="time"||x==="datetime"}),iP=f(function(x){return x==="probe"||x==="sensor"||x==="station"||x==="name"}),iZ=f(function(x){return x.indexOf("depth")>=0}),iV=f(function(x){return x==="vwc"||x==="value"||x.indexOf("moisture")>=0||x.indexOf("vwc")>=0});if(iD<0||iV<0)return null;return lines.slice(1).map(function(l){var c=l.split(","),d=(c[iD]||"").trim(),m=d.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);if(m)d=m[3]+"-"+("0"+m[1]).slice(-2)+"-"+("0"+m[2]).slice(-2);return {date:d.slice(0,10),probe:iP>=0?(c[iP]||"").trim():"",depth:iZ>=0?parseFloat(c[iZ])||0:0,vwc:parseFloat(c[iV])}}).filter(function(r){return r.date&&isFinite(r.vwc)})};
+window.fwProbeCsv=function(fid){var i=document.createElement("input");i.type="file";i.accept=".csv,text/csv";i.onchange=function(){var f=i.files[0];if(!f)return;f.text().then(function(tx){var rows=window.fwParseProbeCsv(tx);if(rows===null)return alert("The file needs a date column and a moisture column.");if(!rows.length)return alert("No readings found in that file.");return fetch("?r=probe-upload",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({farmId:fid,readings:rows})}).then(function(r){return r.json()}).then(function(d){if(d.error)throw new Error(d.error);alert("Added "+d.stored+" daily reading"+(d.stored===1?"":"s")+(d.skipped?" ("+d.skipped+" skipped)":"")+".");document.dispatchEvent(new Event("fw-reload"))})}).catch(function(e){alert(e.message)})};i.click()};
+window.fwTip=function(e,svg){try{var s=JSON.parse(svg.getAttribute("data-s")),th=svg.getAttribute("data-th").split(","),p=+svg.getAttribute("data-p"),W=+svg.getAttribute("data-w"),r=svg.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W,i=Math.max(0,Math.min(s.length-1,Math.round((x-p)/(W-2*p)*(s.length-1)))),a=s[i],px=p+i*(W-2*p)/Math.max(1,s.length-1),st=a[1]<+th[0]?"Dry":a[1]<+th[1]?"Watch":"Moist",l=svg.querySelector(".cl");l.setAttribute("x1",px);l.setAttribute("x2",px);l.setAttribute("opacity",".5");svg.querySelector(".tt").textContent=a[0]+": moisture "+a[1].toFixed(2)+" ("+st+")"+(a[2]!=null?", greenness "+a[2].toFixed(2):"")}catch(_){}};
 (function(){var c=document.getElementById("installTip");if(!c)return;var sa=(window.matchMedia&&matchMedia("(display-mode: standalone)").matches)||navigator.standalone;if(sa)return;if(/iphone|ipad|ipod/i.test(navigator.userAgent)){c.innerHTML="📲 Install Farm Watch on your phone: tap <b>Share</b>, then <b>Add to Home Screen</b>.";c.hidden=false}window.addEventListener("beforeinstallprompt",function(e){e.preventDefault();c.innerHTML='📲 <a href="#" id="instGo"><b>Install Farm Watch</b></a> on this phone.';c.hidden=false;document.getElementById("instGo").onclick=function(ev){ev.preventDefault();e.prompt()}})})();
 window.fwPay=function(show){var c=document.getElementById("payCard");if(show===false){c.hidden=true;return}fetch("?r=me").then(function(r){return r.json()}).then(function(d){var u=d.user,p=d.pay||{};if(!u||(!p.stripe&&!p.paypal)){c.hidden=true;return}var L={trial:"Free trial",alumni:"Alumni farm",basic:"Basic",commercial:"Commercial",active:"Active subscription",past_due:"Payment issue",cancelled:"Cancelled",free:"Free"};var h="<h2>Your plan: "+(L[u.plan]||"Free pilot")+"</h2>";if(["active","free","alumni","basic","commercial"].indexOf(u.plan)<0){h+="<p class=\"help\" style=\"margin:0 0 10px\">Subscribe to keep Farm Watch running for your fields.</p>";if(p.stripe)h+="<a class=\"b\" style=\"display:block;text-align:center;text-decoration:none;margin-bottom:8px\" href=\""+p.stripe+"\" target=\"_blank\" rel=\"noopener\">Pay by card or Apple Pay</a>";if(p.paypal)h+="<a class=\"b alt\" style=\"display:block;text-align:center;text-decoration:none\" href=\""+p.paypal+"\" target=\"_blank\" rel=\"noopener\">Pay with PayPal</a><p class=\"help\" style=\"margin:8px 0 0\">PayPal payments are confirmed by our team, usually within a day.</p>"}else h+="<p class=\"help\" style=\"margin:0\">Thank you for being a customer.</p>";c.innerHTML=h;c.hidden=false}).catch(function(){c.hidden=true})};
 document.getElementById("delAcct").addEventListener("click",function(){var pw=prompt("This permanently deletes your account, farms, logs and labor records. It cannot be undone.\n\nType your password to confirm:");if(!pw)return;fetch("?r=deleteaccount",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||"Could not delete.");alert("Your account has been deleted.");location.reload()})}).catch(function(e){alert(e.message)})});</script>
@@ -2606,6 +2645,15 @@ function budgetHtml(f){var b=f.budget;
   return '<h3>💧 Water budget</h3><div class="adv" style="border-left-color:'+col+'"><b>'+esc(b.headline)+'</b><div style="position:relative;height:12px;border-radius:99px;background:var(--line);margin:12px 0 6px;overflow:hidden"><div style="width:'+w+'%;height:100%;background:'+col+'"></div><div style="position:absolute;left:'+t+'%;top:0;bottom:0;width:2px;background:var(--ink);opacity:.6"></div></div><div class="help" style="margin:0">Used '+b.appliedMm+' of '+b.budgetMm+' mm ('+b.appliedM3+' of '+b.budgetM3+' m&sup3;). The line shows how much of the season has passed.</div>'+(b.detail?'<p style="margin:8px 0 0">'+esc(b.detail)+'</p>':'')+'<p class="help" style="margin:6px 0 0">Counts only the irrigation you log.'+(b.unlogged?' '+b.unlogged+' entries have no amount and are not counted.':'')+'</p></div>';}
 function scoreHtml(f){var s=f.score;if(!s)return "";var col=s.score>=85?"var(--ok)":s.score>=70?"#7bb661":s.score>=50?"#f0a21b":"#e0533c";
   return '<h3>⭐ Farm scorecard</h3><div class="adv" style="border-left-color:'+col+'"><div style="display:flex;align-items:center;gap:14px"><div style="font-size:40px;font-weight:850;color:'+col+';line-height:1">'+s.score+'</div><div><b>'+esc(s.grade)+'</b><div class="help" style="margin:0">out of 100 · '+s.components.length+' factors</div></div></div>'+s.components.map(function(c){return '<div style="margin-top:10px"><div style="display:flex;justify-content:space-between;font-size:13px"><span><b>'+esc(c.name)+'</b> <i class="help">('+c.weight+'% of score)</i></span><b>'+c.score+'</b></div><div style="height:8px;border-radius:9px;background:var(--line);overflow:hidden;margin:3px 0"><div style="width:'+c.score+'%;height:100%;background:'+col+'"></div></div><div class="help" style="margin:0">'+esc(c.text)+'</div></div>'}).join("")+(s.tip?'<p style="margin:12px 0 0"><b>Biggest opportunity:</b> '+esc(s.tip)+'</p>':'')+'<p style="margin:10px 0 0"><a class="b alt sm" style="text-decoration:none" href="?r=report&id='+f.id+'" target="_blank" rel="noopener">📄 Weekly report</a></p></div>';}
+function radarHtml(f){var r=f.radar;if(!r)return "";var old=f.series&&f.series.length?Math.round((Date.now()-new Date(f.series[f.series.length-1].date))/864e5):null,stale=old!==null&&old>10;
+  return '<h3>📡 Radar check <i class="help" style="text-transform:none;letter-spacing:0">(experimental)</i></h3><div class="adv"><b>Soil looks '+esc(r.state)+'</b><div class="help" style="margin:4px 0 0">Sentinel-1 radar, '+esc(r.date)+' ('+r.ageDays+' day'+(r.ageDays===1?'':'s')+' ago). It sees through cloud, and it compares this pass with this field\u2019s own '+r.n+' past passes.'+(stale?' Your latest optical reading is '+old+' days old, so this is the freshest signal.':'')+' Crop growth also affects radar, so treat it as a second opinion.</div></div>'}
+function probeHtml(f){var p=f.probes,h='<h3>📡 Soil probes</h3>';
+  if(!p){return h+'<p class="help" style="margin:0 0 8px">Already have soil probes? Connect them and Farm Watch shows them next to the satellite and checks that the two agree.</p>'+probeTools(f)}
+  h+='<div class="adv">'+p.list.slice(0,8).map(function(x){return '<div style="display:flex;justify-content:space-between"><span>'+esc(x.probe)+(x.depth?' · '+x.depth+' cm':'')+'</span><b>'+x.vwc+'%</b></div>'}).join('')+'<div class="help" style="margin:8px 0 0">'+esc(p.agreement.text)+'</div></div>';
+  if(p.series.length>1){var W=300,H=60,mx=Math.max.apply(null,p.series.map(function(s){return s.vwc})),mn=Math.min.apply(null,p.series.map(function(s){return s.vwc})),d=p.series.map(function(s,i){return (i?"L":"M")+(i*W/(p.series.length-1)).toFixed(1)+" "+(H-6-(s.vwc-mn)/Math.max(.1,mx-mn)*(H-12)).toFixed(1)}).join(" ");
+    h+='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:60px;margin-top:6px" role="img" aria-label="Average probe moisture over time"><path d="'+d+'" fill="none" stroke="var(--wet)" stroke-width="2"/></svg><div class="help" style="margin:0">Average probe moisture, last '+p.series.length+' days with data</div>'}
+  return h+probeTools(f)}
+function probeTools(f){return '<details style="margin-top:8px"><summary><b>Connect or upload probe data</b></summary><p class="help" style="margin:8px 0">1. <b>Upload a CSV</b> with columns <i>date, probe, depth, moisture</i> (moisture as % volumetric water content).</p><p style="margin:0 0 8px"><button class="b alt sm" type="button" onclick="fwProbeCsv('+f.id+')">Upload CSV</button></p><p class="help" style="margin:8px 0">2. <b>Send automatically</b> from any logger or gateway that can post data over the internet.</p><p style="margin:0 0 6px"><button class="b alt sm" type="button" onclick="fwProbeKey('+f.id+')">Show my connection details</button></p><pre id="pk'+f.id+'" class="help" style="white-space:pre-wrap;word-break:break-all;margin:0"></pre></details>'}
 function show(i){
   var f=DATA.farms[i];sel=f.id;armed=null;
   Array.prototype.forEach.call(document.querySelectorAll("#list button"),function(b){b.setAttribute("aria-current",b.getAttribute("data-id")==String(f.id))});
@@ -2642,6 +2690,8 @@ function show(i){
   }else h+='<p class="help">No clear satellite image yet. Tap Update satellite data. Passes happen about every 5 days and cloudy ones are skipped.</p>';
   h+=scoreHtml(f);
   h+=budgetHtml(f);
+  h+=radarHtml(f);
+  h+=probeHtml(f);
   h+='<h3>🌙 Almanac</h3><div id="alm" class="alm help">Loading sun, moon, frost dates and planting windows…</div>';
   h+='<h3>Field settings</h3><p class="help" style="margin:0 0 4px">These make the irrigation advice fit your field.</p><div class="two"><div><label for="sc">Crop</label><input id="sc" maxlength="60" list="crops" value="'+esc(f.crop)+'"></div><div><label for="ss">Soil</label><select id="ss"><option value="">Loam (default)</option><option value="sandy">Sandy (drains fast)</option><option value="loam">Loam</option><option value="clay">Clay (holds water)</option></select></div></div><label for="sm">Irrigation method</label><select id="sm"><option value="">Not sure</option><option value="drip">Drip</option><option value="sprinkler">Sprinkler or pivot</option><option value="flood">Flood or furrow</option></select><label for="sf">System flow (m&sup3; per hour, optional)</label><input id="sf" type="number" min="0" step="1" inputmode="decimal" value="'+(f.flow||"")+'"><label for="sb">Season water allowance (mm, optional)</label><input id="sb" type="number" min="0" step="10" inputmode="decimal" value="'+(f.budgetMm||"")+'"><div class="two"><div><label for="sd">Season starts</label><input id="sd" type="date" value="'+esc(f.seasonStart||"")+'"></div><div><label for="se">Season ends</label><input id="se" type="date" value="'+esc(f.seasonEnd||"")+'"></div></div><button class="b alt sm" type="button" id="setSave">Save field settings</button>';
   var KL={irrigation:"Irrigated",spray:"Sprayed",scouting:"Scouted",other:"Other"},today=new Date().toISOString().slice(0,10);
@@ -2853,6 +2903,7 @@ async function loadAlmanac(f){
 
 /* ---------- tabs ---------- */
 var VIEWS=["Farms","Advisor","Labor"],AI_ON=false;
+document.addEventListener("fw-reload",function(){load()});
 function showView(v){
   if(typeof omap!=="undefined"&&omap)setTimeout(function(){omap.invalidateSize()},80);
   VIEWS.forEach(function(n){var el=$("view"+n);if(el)el.hidden=(n!==v)});
@@ -3173,6 +3224,14 @@ def aqas_selfcheck():
         add("Satellite data (Copernicus)", "fail", str(ex)[:160], "Check CDSE_CLIENT_ID and CDSE_CLIENT_SECRET in Render.")
     except Exception as ex:
         add("Satellite data (Copernicus)", "warn", str(ex)[:160], "Copernicus may be briefly down. Run the check again in a few minutes.")
+    if ENABLE_RADAR:
+        try:
+            tok = get_token()
+            sq = {"type": "Polygon", "coordinates": [[[-3.70, 40.40], [-3.69, 40.40], [-3.69, 40.41], [-3.70, 40.41], [-3.70, 40.40]]]}
+            n = len(request_radar(tok, sq, date.today() - timedelta(days=30), date.today()))
+            add("Radar satellite (Sentinel-1)", "ok", "Radar access works (%d passes found in the last 30 days at a test location)." % n)
+        except Exception as ex:
+            add("Radar satellite (Sentinel-1)", "warn", str(ex)[:160], "Radar is an extra. Farm Watch works without it. Set ENABLE_RADAR=0 in Render to switch it off.")
     try:
         fc = fetch_forecast_remote(40.4, -3.7)
         add("Weather (Open-Meteo)", "ok" if fc and fc[0] else "warn", "Forecast received." if fc and fc[0] else "Empty forecast returned.")
@@ -3410,13 +3469,13 @@ footer{padding:36px 0 46px;color:var(--mute);font-size:14px}footer .w{display:fl
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <nav aria-label="Main"><div class="w"><a class="brand" href="#top"><span class="mark">A1</span>A1 AI</a>
-<div class="links"><a class="hide" href="#features">Features</a><a class="hide" href="#pricing">Pricing</a><a class="hide" href="#faq">FAQ</a><a class="hide" href="@@APP@@">Log in</a><a class="btn sm" href="#book">Book alumni</a></div></div></nav>
+<div class="links"><a class="hide" href="#features">Features</a><a class="hide" href="#pricing">Pricing</a><a class="hide" href="#faq">FAQ</a><a class="hide" href="#book">Book alumni</a><a class="btn sm" href="@@APP@@">Open Farm Watch</a></div></div></nav>
 <main id="main">
 <header class="hero" id="top"><div class="w">
 <div><span class="tag">Alumni farms now booking</span>
 <h1>Satellite irrigation intelligence, <em>managed for you.</em></h1>
 <p class="lead">A1 AI watches every field with Sentinel-2 satellite data, weather and AI, and turns it into one clear daily plan: when, where and how much to irrigate. You stay in control of your farm.</p>
-<div class="cta"><a class="btn" href="#book">Book your alumni spot</a><a class="btn ghost" href="#pricing">See pricing</a></div></div>
+<div class="cta"><a class="btn" href="#book">Book your alumni spot</a><a class="btn ghost" href="@@APP@@">Open Farm Watch</a></div></div>
 <div class="mock" role="img" aria-label="Illustration of the Farm Watch dashboard with sample data"><div class="top"><span>🌽 Sample field · 14.2 ha</span><span class="chip">Irrigate today</span></div>
 <div class="field"><i></i><span>Moisture map · sample</span></div><div class="adv"><b>Irrigate now, about 22 mm</b><small>Start with the driest zones: B2, C1</small></div></div>
 </div></header>
@@ -3433,6 +3492,8 @@ footer{padding:36px 0 46px;color:var(--mute);font-size:14px}footer .w{display:fl
 <div class="card"><div class="ico">🤖</div><h3>AI crop advisor</h3><p>Ask by text or voice, or send a leaf photo. Answers use your own field data and say when to call an agronomist.</p></div>
 <div class="card"><div class="ico">📄</div><h3>Weekly field report</h3><p>A shareable report for owners, managers and agronomists, ready to print or save as a PDF.</p></div>
 <div class="card"><div class="ico">👷</div><h3>Labor and activity log</h3><p>Clock workers in and out, track piece work and cost per hectare. Consent-based, no location tracking.</p></div>
+<div class="card"><div class="ico">📡</div><h3>Works with your probes</h3><p>Already have soil probes? Upload a CSV or send readings from any logger, and see probes and satellite side by side.</p></div>
+<div class="card"><div class="ico">🛰️</div><h3>Cloud-proof radar (beta)</h3><p>Sentinel-1 radar sees through cloud, so you still get a second opinion on soil moisture when optical imagery is blocked.</p></div>
 </div></div></section>
 
 <section class="band"><div class="w"><div class="eyebrow">How it works</div><h2>Managed by us. Controlled by you.</h2>
@@ -3461,6 +3522,8 @@ footer{padding:36px 0 46px;color:var(--mute);font-size:14px}footer .w{display:fl
 <section id="faq"><div class="w"><div class="eyebrow">Questions</div><h2>Straight answers.</h2><div class="faq" id="faqList">
 <details><summary>Do I need sensors or any hardware?</summary><p>No. Farm Watch reads free Sentinel-2 satellite imagery for your field boundary and combines it with local weather.</p></details>
 <details><summary>Do I still control my farm?</summary><p>Yes. You get your own login to see every field and change settings, log irrigation and decide what happens. We monitor and advise. You decide.</p></details>
+<details><summary>Can I connect my existing soil probes?</summary><p>Yes. Upload a CSV from your probe system, or send readings automatically from any logger or gateway that can post data over the internet. We show your probes next to the satellite and check whether the two agree. We can help you set it up.</p></details>
+<details><summary>Which satellites do you use?</summary><p>Sentinel-2 optical imagery for moisture and crop greenness, plus Sentinel-1 radar, which sees through cloud, currently in beta. Both come from the free European Copernicus programme.</p></details>
 <details><summary>How often does it update?</summary><p>Weather and advice refresh daily. A new satellite reading arrives with each clear pass, about every five days. Clouds can delay a reading, and the app shows how old the latest one is.</p></details>
 <details><summary>How accurate is the advice?</summary><p>It is an estimate from satellite data, weather, your crop, soil and irrigation method. It improves when you tell us whether it matched your field. It is guidance, so use your own judgement and local knowledge.</p></details>
 <details><summary>Which crops are supported?</summary><p>More than 60, including almonds, pistachios, corn, cotton and wheat. If yours is missing, we use sensible defaults.</p></details>
@@ -3505,6 +3568,220 @@ $('bookForm').addEventListener('submit',function(e){
 """
 SITE_HOST = (os.environ.get("SITE_HOST") or "").strip().lower()
 SITE_APP = (os.environ.get("APP_URL") or "").strip().rstrip("/") or "/"
+
+
+# ---------- Sentinel-1 radar (cloud-proof, experimental) ----------
+ENABLE_RADAR = os.environ.get("ENABLE_RADAR", "1") != "0"
+RADAR_EVALSCRIPT = """
+//VERSION=3
+function setup() {
+  return {input: [{bands: ["VV", "VH", "dataMask"]}],
+          output: [{id: "vv", bands: 1}, {id: "vh", bands: 1}, {id: "dataMask", bands: 1}]};
+}
+function evaluatePixel(s) { return {vv: [s.VV], vh: [s.VH], dataMask: [s.dataMask]}; }
+"""
+
+
+def request_radar(token, geometry, start, end):
+    """Daily Sentinel-1 backscatter averages for a field. Radar sees through cloud."""
+    payload = {
+        "input": {"bounds": {"geometry": geometry, "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}},
+                  "data": [{"type": "sentinel-1-grd",
+                            "dataFilter": {"acquisitionMode": "IW", "polarization": "DV", "resolution": "HIGH"},
+                            "processing": {"backCoeff": "GAMMA0_TERRAIN", "orthorectify": True, "demInstance": "COPERNICUS_30"}}]},
+        "aggregation": {"timeRange": {"from": f"{start}T00:00:00Z", "to": f"{end + timedelta(days=1)}T00:00:00Z"},
+                        "aggregationInterval": {"of": "P1D"}, "evalscript": RADAR_EVALSCRIPT, "resx": RES_DEG, "resy": RES_DEG},
+    }
+    for attempt in range(3):
+        req = Request(STATS_URL, data=json.dumps(payload).encode(), method="POST",
+                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+        try:
+            with urlopen(req, timeout=120) as r:
+                return json.loads(r.read()).get("data", [])
+        except HTTPError as e:
+            if e.code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Copernicus radar error {e.code}: " + e.read().decode("utf-8", "replace")[:160])
+    raise RuntimeError("Rate limited by Copernicus; radar will retry on the next run.")
+
+
+def parse_radar(items):
+    out = []
+    for it in items:
+        try:
+            o = it["outputs"]
+            a, b = o["vv"]["bands"]["B0"]["stats"], o["vh"]["bands"]["B0"]["stats"]
+            total = a["sampleCount"]
+            valid = (total - a["noDataCount"]) / total if total else 0
+            vv, vh = float(a["mean"]), float(b["mean"])
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+        if valid < MIN_CLEAR or vv <= 0 or vh <= 0 or math.isnan(vv) or math.isnan(vh):
+            continue
+        out.append({"date": it["interval"]["from"][:10], "vv": round(10 * math.log10(vv), 2), "vh": round(10 * math.log10(vh), 2)})
+    return out
+
+
+def radar_index(rows, today=None):
+    """Compares the latest radar pass with this field's own history. Radar backscatter rises with wetter soil,
+    but crop and roughness also matter, so only the field's own history is a fair yardstick."""
+    vals = sorted((r["date"], _f(r["vv_db"])) for r in rows if _f(r.get("vv_db")) is not None)
+    if len(vals) < 6:
+        return None
+    last_d, last = vals[-1]
+    hist = [v for _, v in vals[:-1]]
+    pct = round(sum(1 for v in hist if v <= last) / len(hist) * 100)
+    today = today or date.today()
+    return {"date": last_d, "vvDb": round(last, 1), "pct": pct, "n": len(vals), "ageDays": (today - date.fromisoformat(last_d)).days,
+            "state": "wetter than usual" if pct >= 67 else "drier than usual" if pct <= 33 else "about typical"}
+
+
+# ---------- soil probes: CSV upload and an open API for any logger ----------
+_PROBE_HITS = {}
+
+
+def clean_probe_rows(rows):
+    """Validate and average to one value per probe, depth and day."""
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("No readings found.")
+    if len(rows) > 2000:
+        raise ValueError("Send at most 2000 readings at a time.")
+    agg, skipped = {}, 0
+    lo, hi = date.today() - timedelta(days=400), date.today() + timedelta(days=1)
+    for r in rows:
+        try:
+            d = date.fromisoformat(str(r.get("date") or "")[:10])
+            v = float(r.get("vwc", r.get("value", r.get("moisture"))))
+            z = float(r.get("depth") if r.get("depth") is not None else r.get("depth_cm") or 0)
+            name = (str(r.get("probe") or "Probe 1").strip() or "Probe 1")[:40]
+        except (ValueError, TypeError, AttributeError):
+            skipped += 1
+            continue
+        if not (lo <= d <= hi) or not (0 <= v <= 100) or not (0 <= z <= 300) or math.isnan(v):
+            skipped += 1
+            continue
+        k = (name, round(z, 1), d.isoformat())
+        agg.setdefault(k, []).append(v)
+    return [(k[0], k[1], k[2], round(sum(v) / len(v), 2)) for k, v in agg.items()], skipped
+
+
+def store_probe_rows(farm_id, rows):
+    good, skipped = clean_probe_rows(rows)
+    if not good:
+        raise ValueError("None of the readings were valid. Use dates like 2026-11-01 and moisture between 0 and 100.")
+    for i in range(0, len(good), 200):
+        chunk, marks, params = good[i:i + 200], [], []
+        for j, (name, z, d, v) in enumerate(chunk):
+            marks.append("(" + ",".join("$%d" % (j * 5 + k) for k in range(1, 6)) + ")")
+            params += [farm_id, name, z, d, v]
+        sql("INSERT INTO fw_probe_readings (farm_id, probe, depth_cm, date, vwc) VALUES " + ",".join(marks) +
+            " ON CONFLICT (farm_id, probe, depth_cm, date) DO UPDATE SET vwc = EXCLUDED.vwc", params)
+    return {"stored": len(good), "skipped": skipped}
+
+
+def probe_key_for(user_id, farm_id, reset=False):
+    rows = sql("SELECT probe_key FROM fw_farms WHERE id=$1 AND user_id=$2", (farm_id, user_id))
+    if not rows:
+        raise ValueError("Farm not found.")
+    key = rows[0].get("probe_key")
+    if reset or not key:
+        key = "fwp_" + secrets.token_urlsafe(24)
+        sql("UPDATE fw_farms SET probe_key=$1 WHERE id=$2 AND user_id=$3", (key, farm_id, user_id))
+    return key
+
+
+def probe_ingest_by_key(key, rows, now=None):
+    now = now or time.time()
+    hits = [x for x in _PROBE_HITS.get(key, []) if now - x < 3600]
+    if len(hits) >= 120:
+        raise ValueError("Too many requests. Try again later.")
+    _PROBE_HITS[key] = hits + [now]
+    r = sql("SELECT id FROM fw_farms WHERE probe_key=$1", (key,)) if key and str(key).startswith("fwp_") else []
+    if not r:
+        raise PermissionError("Unknown probe key.")
+    return store_probe_rows(int(r[0]["id"]), rows)
+
+
+def _pearson(xs, ys):
+    n = len(xs)
+    if n < 5:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sx, sy = sum((x - mx) ** 2 for x in xs), sum((y - my) ** 2 for y in ys)
+    if sx <= 0 or sy <= 0:
+        return None
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / math.sqrt(sx * sy)
+
+
+def probe_summary(rows, readings):
+    """Latest value per probe and depth, a daily average line, and whether probes and satellite move together."""
+    if not rows:
+        return None
+    latest, by_day = {}, {}
+    for r in sorted(rows, key=lambda r: r["date"]):
+        latest[(r["probe"], _f(r["depth_cm"]))] = r
+        by_day.setdefault(r["date"], []).append(_f(r["vwc"]))
+    series = [{"date": d, "vwc": round(sum(v) / len(v), 1)} for d, v in sorted(by_day.items())][-60:]
+    xs, ys = [], []
+    for rd in readings or []:
+        try:
+            dd = date.fromisoformat(rd["date"])
+        except (KeyError, ValueError):
+            continue
+        near = [s for s in series if abs((date.fromisoformat(s["date"]) - dd).days) <= 2]
+        if near and rd.get("ndmi") is not None:
+            xs.append(rd["ndmi"]); ys.append(near[0]["vwc"])
+    r = _pearson(xs, ys)
+    if r is None:
+        agree = {"text": "Not enough days with both a probe reading and a clear satellite pass yet. Agreement is shown after 5 matching days.", "r": None, "pairs": len(xs)}
+    else:
+        agree = {"r": round(r, 2), "pairs": len(xs),
+                 "text": ("Probes and satellite move together (r = %.2f over %d days)." % (r, len(xs))) if r >= 0.6 else
+                         ("Probes and satellite partly agree (r = %.2f over %d days)." % (r, len(xs))) if r >= 0.3 else
+                         ("Probes and satellite do not agree well (r = %.2f over %d days). Check the probe location and depth." % (r, len(xs)))}
+    return {"list": [{"probe": k[0], "depth": k[1], "date": v["date"], "vwc": round(_f(v["vwc"]), 1)} for k, v in latest.items()],
+            "series": series, "agreement": agree}
+
+
+def aqas_attention():
+    """What the owner should act on today, most important first."""
+    items = []
+    try:
+        fl = aqas_fields()
+        dry = [f for f in fl["fields"] if f["status"] == "Dry"]
+        if dry:
+            items.append({"level": "high", "text": "%d dry field%s: %s." % (len(dry), "" if len(dry) == 1 else "s", ", ".join("%s (%s)" % (f["name"], f["client"]) for f in dry[:5]))})
+        stale = [f for f in fl["fields"] if f["ageDays"] is not None and f["ageDays"] > 14]
+        if stale:
+            items.append({"level": "medium", "text": "%d field%s with no fresh satellite reading in 14 days. Cloud, or a fetch problem." % (len(stale), "" if len(stale) == 1 else "s")})
+        nod = [f for f in fl["fields"] if f["status"] == "no reading yet"]
+        if nod:
+            items.append({"level": "low", "text": "%d new field%s waiting for a first satellite reading." % (len(nod), "" if len(nod) == 1 else "s")})
+    except Exception:
+        pass
+    try:
+        ac = aqas_accounts()["accounts"]
+        pd = [a for a in ac if a["plan"] == "past_due"]
+        if pd:
+            items.append({"level": "high", "text": "%d client%s with a payment problem: %s." % (len(pd), "" if len(pd) == 1 else "s", ", ".join(a["name"] or a["email"] for a in pd[:5]))})
+        inv = [a for a in ac if a["activity"] == "invited" and a["created"] and a["created"] <= (date.today() - timedelta(days=3)).isoformat()]
+        if inv:
+            items.append({"level": "medium", "text": "%d client%s invited 3 or more days ago and never signed in: %s." % (len(inv), "" if len(inv) == 1 else "s", ", ".join(a["name"] or a["email"] for a in inv[:5]))})
+        ina = [a for a in ac if a["activity"] == "inactive" and a["plan"] in PAID_PLANS]
+        if ina:
+            items.append({"level": "medium", "text": "%d paying client%s not seen in 30 days: %s." % (len(ina), "" if len(ina) == 1 else "s", ", ".join(a["name"] or a["email"] for a in ina[:5]))})
+    except Exception:
+        pass
+    try:
+        qs = [q for q in aqas_questions()["questions"] if not q["reply"]]
+        if qs:
+            items.append({"level": "high", "text": "%d unanswered question%s from the website." % (len(qs), "" if len(qs) == 1 else "s")})
+    except Exception:
+        pass
+    order = {"high": 0, "medium": 1, "low": 2}
+    items.sort(key=lambda x: order[x["level"]])
+    return {"items": items}
 
 
 class handler(BaseHTTPRequestHandler):
@@ -3615,7 +3892,7 @@ class handler(BaseHTTPRequestHandler):
                 return self._send(200, AQAS_HTML.encode("utf-8"), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
             if r == "health":
                 return self._json(200, {"ok": True, "aqas": "phase-1-simulated"})
-            if r in ("aqas-status", "aqas-events", "aqas-proposals", "aqas-health", "aqas-accounts", "aqas-selfcheck", "aqas-fields", "aqas-questions"):
+            if r in ("aqas-status", "aqas-events", "aqas-proposals", "aqas-health", "aqas-accounts", "aqas-selfcheck", "aqas-fields", "aqas-questions", "aqas-attention"):
                 if not self._aqas_gate():
                     return
                 if r == "aqas-health":
@@ -3626,6 +3903,8 @@ class handler(BaseHTTPRequestHandler):
                     return self._json(200, aqas_selfcheck())
                 if r == "aqas-fields":
                     return self._json(200, aqas_fields())
+                if r == "aqas-attention":
+                    return self._json(200, aqas_attention())
                 if r == "aqas-questions":
                     return self._json(200, aqas_questions())
                 snap = aqas_snapshot()
@@ -3692,6 +3971,15 @@ class handler(BaseHTTPRequestHandler):
                 data = self._read_json(1_600_000)
                 return self._json(200, ask_advisor(user, int(data.get("farmId") or 0), data.get("question"),
                                                    data.get("image"), data.get("mediaType") or "image/jpeg"))
+            if r == "probe-ingest":
+                try:
+                    raw = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 400_000))
+                    d = json.loads(raw.decode("utf-8") or "{}")
+                    return self._send(200, dict(probe_ingest_by_key(str(d.get("key") or ""), d.get("readings")), ok=True), extra=CORS_POST)
+                except PermissionError as ex:
+                    return self._send(401, {"error": str(ex)}, extra=CORS_POST)
+                except (ValueError, KeyError, TypeError) as ex:
+                    return self._send(400, {"error": str(ex) or "Bad request."}, extra=CORS_POST)
             if r == "ask-us":
                 try:
                     raw = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 20000))
@@ -3839,6 +4127,13 @@ class handler(BaseHTTPRequestHandler):
                     raise ValueError("Missing log id.")
                 delete_log(user["id"], int(lid))
                 return self._json(200, {"deleted": True})
+            if r == "probe-key":
+                return self._json(200, {"key": probe_key_for(user["id"], int(data.get("farmId") or 0), bool(data.get("reset")))})
+            if r == "probe-upload":
+                fid = int(data.get("farmId") or 0)
+                if not sql("SELECT id FROM fw_farms WHERE id=$1 AND user_id=$2", (fid, user["id"])):
+                    raise ValueError("Farm not found.")
+                return self._json(200, dict(store_probe_rows(fid, data.get("readings")), ok=True))
             if r == "deleteaccount":
                 rows = sql("SELECT pw_hash FROM fw_users WHERE id=$1", (user["id"],))
                 if not rows or not check_pw(data.get("password") or "", rows[0]["pw_hash"]):

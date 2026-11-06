@@ -61,13 +61,13 @@ footer{padding:36px 0 46px;color:var(--mute);font-size:14px}footer .w{display:fl
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <nav aria-label="Main"><div class="w"><a class="brand" href="#top"><span class="mark">A1</span>A1 AI</a>
-<div class="links"><a class="hide" href="#features">Features</a><a class="hide" href="#pricing">Pricing</a><a class="hide" href="#faq">FAQ</a><a class="hide" href="@@APP@@">Log in</a><a class="btn sm" href="#book">Book alumni</a></div></div></nav>
+<div class="links"><a class="hide" href="#features">Features</a><a class="hide" href="#pricing">Pricing</a><a class="hide" href="#faq">FAQ</a><a class="hide" href="#book">Book alumni</a><a class="btn sm" href="@@APP@@">Open Farm Watch</a></div></div></nav>
 <main id="main">
 <header class="hero" id="top"><div class="w">
 <div><span class="tag">Alumni farms now booking</span>
 <h1>Satellite irrigation intelligence, <em>managed for you.</em></h1>
 <p class="lead">A1 AI watches every field with Sentinel-2 satellite data, weather and AI, and turns it into one clear daily plan: when, where and how much to irrigate. You stay in control of your farm.</p>
-<div class="cta"><a class="btn" href="#book">Book your alumni spot</a><a class="btn ghost" href="#pricing">See pricing</a></div></div>
+<div class="cta"><a class="btn" href="#book">Book your alumni spot</a><a class="btn ghost" href="@@APP@@">Open Farm Watch</a></div></div>
 <div class="mock" role="img" aria-label="Illustration of the Farm Watch dashboard with sample data"><div class="top"><span>🌽 Sample field · 14.2 ha</span><span class="chip">Irrigate today</span></div>
 <div class="field"><i></i><span>Moisture map · sample</span></div><div class="adv"><b>Irrigate now, about 22 mm</b><small>Start with the driest zones: B2, C1</small></div></div>
 </div></header>
@@ -84,6 +84,8 @@ footer{padding:36px 0 46px;color:var(--mute);font-size:14px}footer .w{display:fl
 <div class="card"><div class="ico">🤖</div><h3>AI crop advisor</h3><p>Ask by text or voice, or send a leaf photo. Answers use your own field data and say when to call an agronomist.</p></div>
 <div class="card"><div class="ico">📄</div><h3>Weekly field report</h3><p>A shareable report for owners, managers and agronomists, ready to print or save as a PDF.</p></div>
 <div class="card"><div class="ico">👷</div><h3>Labor and activity log</h3><p>Clock workers in and out, track piece work and cost per hectare. Consent-based, no location tracking.</p></div>
+<div class="card"><div class="ico">📡</div><h3>Works with your probes</h3><p>Already have soil probes? Upload a CSV or send readings from any logger, and see probes and satellite side by side.</p></div>
+<div class="card"><div class="ico">🛰️</div><h3>Cloud-proof radar (beta)</h3><p>Sentinel-1 radar sees through cloud, so you still get a second opinion on soil moisture when optical imagery is blocked.</p></div>
 </div></div></section>
 
 <section class="band"><div class="w"><div class="eyebrow">How it works</div><h2>Managed by us. Controlled by you.</h2>
@@ -112,6 +114,8 @@ footer{padding:36px 0 46px;color:var(--mute);font-size:14px}footer .w{display:fl
 <section id="faq"><div class="w"><div class="eyebrow">Questions</div><h2>Straight answers.</h2><div class="faq" id="faqList">
 <details><summary>Do I need sensors or any hardware?</summary><p>No. Farm Watch reads free Sentinel-2 satellite imagery for your field boundary and combines it with local weather.</p></details>
 <details><summary>Do I still control my farm?</summary><p>Yes. You get your own login to see every field and change settings, log irrigation and decide what happens. We monitor and advise. You decide.</p></details>
+<details><summary>Can I connect my existing soil probes?</summary><p>Yes. Upload a CSV from your probe system, or send readings automatically from any logger or gateway that can post data over the internet. We show your probes next to the satellite and check whether the two agree. We can help you set it up.</p></details>
+<details><summary>Which satellites do you use?</summary><p>Sentinel-2 optical imagery for moisture and crop greenness, plus Sentinel-1 radar, which sees through cloud, currently in beta. Both come from the free European Copernicus programme.</p></details>
 <details><summary>How often does it update?</summary><p>Weather and advice refresh daily. A new satellite reading arrives with each clear pass, about every five days. Clouds can delay a reading, and the app shows how old the latest one is.</p></details>
 <details><summary>How accurate is the advice?</summary><p>It is an estimate from satellite data, weather, your crop, soil and irrigation method. It improves when you tell us whether it matched your field. It is guidance, so use your own judgement and local knowledge.</p></details>
 <details><summary>Which crops are supported?</summary><p>More than 60, including almonds, pistachios, corn, cotton and wheat. If yours is missing, we use sensible defaults.</p></details>
