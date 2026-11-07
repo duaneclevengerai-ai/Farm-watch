@@ -88,7 +88,7 @@ RES_DEG = 0.0001           # about 10 m; pixel size in degrees
 MAX_BBOX_DEG = 0.2         # reject boundaries wider or taller than about 20 km
 SERIES_LEN = 60            # readings per farm sent to the page
 FETCH_BUDGET_S = 240       # stop starting new farms after this long
-MAX_FARMS_PER_USER = 20
+MAX_FARMS_PER_USER = int(os.environ.get("MAX_FARMS_PER_USER") or 100)
 FORECAST_TTL_S = 3600
 PBKDF2_ITERS = 200_000
 RESET_TTL_S = 3600
@@ -246,6 +246,13 @@ def ensure_schema():
                 user_id INTEGER NOT NULL REFERENCES fw_users(id) ON DELETE CASCADE,
                 farm_id INTEGER REFERENCES fw_farms(id) ON DELETE CASCADE,
                 question TEXT NOT NULL, answer TEXT NOT NULL, had_image INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL)""")
+            sql("""CREATE TABLE IF NOT EXISTS fw_nps (
+                id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES fw_users(id) ON DELETE CASCADE,
+                score INTEGER NOT NULL, comment TEXT, created TEXT NOT NULL)""")
+            sql("CREATE TABLE IF NOT EXISTS fw_settings (skey TEXT PRIMARY KEY, sval TEXT)")
+            sql("""CREATE TABLE IF NOT EXISTS fw_payments (
+                id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES fw_users(id) ON DELETE CASCADE,
+                amount DOUBLE PRECISION, method TEXT, note TEXT, created TEXT NOT NULL)""")
             sql("""CREATE TABLE IF NOT EXISTS fw_questions (
                 id SERIAL PRIMARY KEY, name TEXT, email TEXT, message TEXT NOT NULL, created TEXT NOT NULL,
                 reply TEXT, replied TEXT, public INTEGER NOT NULL DEFAULT 0)""")
@@ -658,13 +665,22 @@ def fetch_forecast_remote(lat, lon):
         qq = dict(q)
         if cur_vars:
             qq["current"] = cur_vars
-        try:
-            with urlopen(Request(base + "?" + urlencode(qq), headers={"User-Agent": "FarmWatch/1.0"}), timeout=20) as r:
-                data = json.loads(r.read())
+        done = False
+        for attempt in range(3):
+            try:
+                with urlopen(Request(base + "?" + urlencode(qq), headers={"User-Agent": "FarmWatch/1.0"}), timeout=20) as r:
+                    data = json.loads(r.read())
+                done = True
+                break
+            except HTTPError as e:
+                if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                    time.sleep(2 * (attempt + 1))  # the weather service is busy; wait and try again
+                    continue
+                if e.code != 400 or i == len(variants) - 1:
+                    raise
+                break
+        if done:
             break
-        except HTTPError as e:
-            if e.code != 400 or i == len(variants) - 1:
-                raise
     d = data["daily"]
     days = []
     for i, t_ in enumerate(d["time"]):
@@ -2291,7 +2307,7 @@ def aqas_log_daily(result):
         print("AQAS log failed:", e, file=sys.stderr)
 
 
-AQAS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AQAS Pro Control Room</title><style>:root{color-scheme:dark;--line:#26364f;--muted:#a8b7cc;--text:#f4f7fb;--accent:#7dd3fc;--amber:#fcd34d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#162846,#0a1020 60%);color:var(--text);font:15px system-ui,sans-serif}.wrap{max-width:1150px;margin:auto;padding:28px 18px 60px}.top,.sectionhead{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.brand{font-size:12px;letter-spacing:.2em;color:var(--accent);font-weight:800}.subtitle,.muted{color:var(--muted);font-size:13px}.badge,.status{border:1px solid #806b2e;color:var(--amber);border-radius:99px;padding:7px 11px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:24px 0}.card,section{background:rgba(17,27,46,.94);border:1px solid var(--line);border-radius:16px;padding:18px}.notice{background:#172a40;border:1px solid #31506c;padding:12px;border-radius:10px;margin:14px 0}.tokenbox,.row{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.tokenbox input{flex:1;min-width:220px}.proposal,.event{border-top:1px solid var(--line);padding:14px 0}.risk{font-size:11px;text-transform:uppercase;color:var(--amber)}.risk.high{color:#fca5a5}.risk.low{color:#86efac}button,input,textarea,select{font:inherit;border-radius:9px;border:1px solid #344761;padding:10px;background:#0b1425;color:var(--text)}button{cursor:pointer;background:#173c59;border-color:#2b6c91}button.secondary{background:#1c293d}button.danger{background:#51272c}input,select,textarea{width:100%}textarea{min-height:70px}label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.wide{grid-column:1/-1}.empty{color:var(--muted);padding:16px 0}@media(max-width:600px){.formgrid{grid-template-columns:1fr}.wide{grid-column:auto}}</style></head><body><div class="wrap"><div class="top"><div><div class="brand">AQAS PRO / CONTROL ROOM</div><h1 style="margin:7px 0 0">FarmWatch Operations</h1><div class="subtitle">Supervisor foundation · auditable · human-approved</div></div><span class="badge">SIMULATION MODE · NO LIVE AGENT ACTIONS</span></div><div class="notice">Phase 1 is intentionally safe: agents are paused and simulated. Approving a proposal records the decision only; it does not change production systems or send outreach.</div><div class="tokenbox"><input id="token" type="password" autocomplete="off" placeholder="AQAS_ADMIN_TOKEN (not your OpenAI key)"><button onclick="saveToken()">Connect control room</button><button class="secondary" onclick="refresh()">Refresh</button></div><div id="message" class="muted">Set AQAS_ADMIN_TOKEN in Render, then enter the same value here.</div><div id="agents" class="grid"></div><section><div class="sectionhead"><h2>Farm Watch health</h2><span class="muted">Live counts from the running system</span></div><div id="health" class="grid"></div></section><section><div class="sectionhead"><h2>Needs your attention</h2><span class="muted">What to act on today</span></div><div id="attn" class="empty">Connect to load.</div></section><section><div class="sectionhead"><h2>Go-live check</h2><span class="muted">Tests every connected service</span></div><button id="chkbtn" type="button" onclick="runCheck()">Run check</button><div id="chk"></div></section><section><div class="sectionhead"><h2>Add a client</h2><span class="muted">They choose their own password</span></div><div class="card"><input id="nc_name" placeholder="Client name"> <input id="nc_email" type="email" placeholder="Client email"> <select id="nc_plan"><option value="alumni">alumni</option><option value="basic">basic</option><option value="commercial">commercial</option><option value="trial">trial</option></select> <label><input id="nc_send" type="checkbox"> email the invite</label> <button type="button" onclick="newClient()">Create client</button><div id="nc_out" class="muted" style="margin-top:8px"></div></div></section><section><div class="sectionhead"><h2>Clients</h2><span class="muted">Usage only. Clients control their own farming</span></div><div id="accts" class="empty">Connect to load clients.</div></section><section><div class="sectionhead"><h2>All fields</h2><span class="muted">Every client, driest first</span></div><div id="fields" class="empty">Connect to load fields.</div></section><section><div class="sectionhead"><h2>Questions</h2><span class="muted">From your website</span></div><div id="qs" class="empty">Connect to load questions.</div></section><section><div class="sectionhead"><h2>Proposal queue</h2><span class="muted">All behavior changes require approval</span></div><div id="proposals" class="empty">Connect to load proposals.</div></section><section style="margin-top:16px"><div class="sectionhead"><h2>Create a proposal</h2><span class="muted">No direct execution</span></div><form id="proposalForm"><div class="formgrid"><div><label>Agent</label><select id="agent"><option>ARAIAH</option><option>Pluto</option><option>Orion</option><option>AQAS</option></select></div><div><label>Risk level</label><select id="risk"><option>low</option><option>medium</option><option>high</option></select></div><div class="wide"><label>Proposal title</label><input id="title" required maxlength="180"></div><div class="wide"><label>Reason / evidence</label><textarea id="rationale" required maxlength="2000"></textarea></div><div class="wide"><label>Expected effect</label><textarea id="effect" required maxlength="1000"></textarea></div><div class="wide"><label>Proposed change (plain-language description)</label><textarea id="change" maxlength="2000"></textarea></div></div><div class="row"><button type="submit">Submit for review</button></div></form></section><section style="margin-top:16px"><div class="sectionhead"><h2>Audit trail</h2><span class="muted">Most recent 50 events</span></div><div id="events" class="empty">Connect to load events.</div></section></div><script>const $=id=>document.getElementById(id);function token(){return sessionStorage.getItem('aqas_admin_token')||''}function saveToken(){sessionStorage.setItem('aqas_admin_token',$('token').value.trim());refresh()}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function api(r,method='GET',body){const res=await fetch('?r='+encodeURIComponent(r),{method,headers:{'Authorization':'Bearer '+token(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store'});let d={};try{d=await res.json()}catch{}if(!res.ok)throw Error(d.error||'Request failed ('+res.status+')');return d}async function refresh(){if($('token').value)sessionStorage.setItem('aqas_admin_token',$('token').value.trim());$('message').textContent='Connecting…';try{const d=await api('aqas-status');loadAccts();loadFields();loadQs();loadAttention();try{const h=await api('aqas-health');$('health').innerHTML=h.cards.map(c=>`<div class="card"><div class="muted">${esc(c.label)}</div><h2 style="margin:6px 0 0">${esc(c.value)}</h2><div class="muted">${esc(c.note||'')}</div></div>`).join('')}catch(e){$('health').innerHTML=''}$('message').textContent='Connected · OpenAI key '+(d.openaiConfigured?'configured':'not configured')+' · live agent actions disabled';$('agents').innerHTML=d.agents.map(a=>`<div class="card"><div class="sectionhead"><h3>${esc(a.agent)}</h3><span class="status">${esc(a.status)}</span></div><div class="muted">${esc((a.metrics||{}).description||'Specialist agent')}</div><p>Mode: <b>${esc(a.mode)}</b></p><p>Daily contact cap: <b>${esc(a.daily_cap)}</b></p><div class="row"><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','paused')">Pause</button><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','simulated')">Set simulated</button></div></div>`).join('');$('proposals').innerHTML=d.pendingProposals.length?d.pendingProposals.map(p=>`<div class="proposal"><div class="sectionhead"><h3>${esc(p.title)}</h3><span class="risk ${esc(p.risk)}">${esc(p.risk)} risk</span></div><div class="muted">${esc(p.agent)} · ${esc(p.created_at)}</div><p>${esc(p.rationale)}</p><p><b>Expected effect:</b> ${esc(p.expected_effect)}</p><p class="muted">Proposed change: ${esc(JSON.stringify(p.proposed_change))}</p><div class="row"><button onclick="decide(${p.id},'approved')">Approve record</button><button class="danger" onclick="decide(${p.id},'rejected')">Reject</button></div></div>`).join(''):'<div class="empty">No pending proposals.</div>';$('events').innerHTML=d.events.length?d.events.map(e=>`<div class="event"><div class="muted">${esc(e.occurred_at)} · ${esc(e.actor)} · ${esc(e.event_type)} ${e.agent?'· '+esc(e.agent):''}</div><div>${esc(e.summary)}</div></div>`).join(''):'<div class="empty">No events yet.</div>'}catch(e){$('message').textContent=e.message;$('agents').innerHTML='';$('proposals').innerHTML='<div class="empty">Not connected.</div>'}}function ringOf(coords){var r=coords.map(function(c){return [c[1],c[0]]});if(r.length>1&&r[0][0]===r[r.length-1][0]&&r[0][1]===r[r.length-1][1])r.pop();return r}
+AQAS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AQAS Pro Control Room</title><style>:root{color-scheme:dark;--line:#26364f;--muted:#a8b7cc;--text:#f4f7fb;--accent:#7dd3fc;--amber:#fcd34d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#162846,#0a1020 60%);color:var(--text);font:15px system-ui,sans-serif}.wrap{max-width:1150px;margin:auto;padding:28px 18px 60px}.top,.sectionhead{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.brand{font-size:12px;letter-spacing:.2em;color:var(--accent);font-weight:800}.subtitle,.muted{color:var(--muted);font-size:13px}.badge,.status{border:1px solid #806b2e;color:var(--amber);border-radius:99px;padding:7px 11px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:24px 0}.card,section{background:rgba(17,27,46,.94);border:1px solid var(--line);border-radius:16px;padding:18px}.notice{background:#172a40;border:1px solid #31506c;padding:12px;border-radius:10px;margin:14px 0}.tokenbox,.row{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.tokenbox input{flex:1;min-width:220px}.proposal,.event{border-top:1px solid var(--line);padding:14px 0}.risk{font-size:11px;text-transform:uppercase;color:var(--amber)}.risk.high{color:#fca5a5}.risk.low{color:#86efac}button,input,textarea,select{font:inherit;border-radius:9px;border:1px solid #344761;padding:10px;background:#0b1425;color:var(--text)}button{cursor:pointer;background:#173c59;border-color:#2b6c91}button.secondary{background:#1c293d}button.danger{background:#51272c}input,select,textarea{width:100%}textarea{min-height:70px}label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.wide{grid-column:1/-1}.empty{color:var(--muted);padding:16px 0}@media(max-width:600px){.formgrid{grid-template-columns:1fr}.wide{grid-column:auto}}</style></head><body><div class="wrap"><div class="top"><div><div class="brand">AQAS PRO / CONTROL ROOM</div><h1 style="margin:7px 0 0">FarmWatch Operations</h1><div class="subtitle">Supervisor foundation · auditable · human-approved</div></div><span class="badge">SIMULATION MODE · NO LIVE AGENT ACTIONS</span></div><div class="notice">Phase 1 is intentionally safe: agents are paused and simulated. Approving a proposal records the decision only; it does not change production systems or send outreach.</div><div class="tokenbox"><input id="token" type="password" autocomplete="off" placeholder="AQAS_ADMIN_TOKEN (not your OpenAI key)"><button onclick="saveToken()">Connect control room</button><button class="secondary" onclick="refresh()">Refresh</button></div><div id="message" class="muted">Set AQAS_ADMIN_TOKEN in Render, then enter the same value here.</div><div id="agents" class="grid"></div><section><div class="sectionhead"><h2>Farm Watch health</h2><span class="muted">Live counts from the running system</span></div><div id="health" class="grid"></div></section><section><div class="sectionhead"><h2>Needs your attention</h2><span class="muted">What to act on today</span></div><div id="attn" class="empty">Connect to load.</div></section><section><div class="sectionhead"><h2>Customer satisfaction</h2><span class="muted">How your clients rate you</span></div><div id="nps" class="empty">Connect to load.</div></section><section><div class="sectionhead"><h2>Go-live check</h2><span class="muted">Tests every connected service</span></div><button id="chkbtn" type="button" onclick="runCheck()">Run check</button><div id="chk"></div></section><section><div class="sectionhead"><h2>Add a client</h2><span class="muted">They choose their own password</span></div><div class="card"><input id="nc_name" placeholder="Client name"> <input id="nc_email" type="email" placeholder="Client email"> <select id="nc_plan"><option value="alumni">alumni</option><option value="basic">basic</option><option value="commercial">commercial</option><option value="trial">trial</option></select> <label><input id="nc_send" type="checkbox"> email the invite</label> <button type="button" onclick="newClient()">Create client</button><div id="nc_out" class="muted" style="margin-top:8px"></div></div></section><section><div class="sectionhead"><h2>Payments</h2><span class="muted">Payment links and button text</span></div><div id="pay" class="empty">Connect to load.</div></section><section><div class="sectionhead"><h2>Clients</h2><span class="muted">Usage only. Clients control their own farming</span></div><div id="accts" class="empty">Connect to load clients.</div></section><section><div class="sectionhead"><h2>All fields</h2><span class="muted">Every client, driest first</span></div><div id="fields" class="empty">Connect to load fields.</div></section><section><div class="sectionhead"><h2>Questions</h2><span class="muted">From your website</span></div><div id="qs" class="empty">Connect to load questions.</div></section><section><div class="sectionhead"><h2>Proposal queue</h2><span class="muted">All behavior changes require approval</span></div><div id="proposals" class="empty">Connect to load proposals.</div></section><section style="margin-top:16px"><div class="sectionhead"><h2>Create a proposal</h2><span class="muted">No direct execution</span></div><form id="proposalForm"><div class="formgrid"><div><label>Agent</label><select id="agent"><option>ARAIAH</option><option>Pluto</option><option>Orion</option><option>AQAS</option></select></div><div><label>Risk level</label><select id="risk"><option>low</option><option>medium</option><option>high</option></select></div><div class="wide"><label>Proposal title</label><input id="title" required maxlength="180"></div><div class="wide"><label>Reason / evidence</label><textarea id="rationale" required maxlength="2000"></textarea></div><div class="wide"><label>Expected effect</label><textarea id="effect" required maxlength="1000"></textarea></div><div class="wide"><label>Proposed change (plain-language description)</label><textarea id="change" maxlength="2000"></textarea></div></div><div class="row"><button type="submit">Submit for review</button></div></form></section><section style="margin-top:16px"><div class="sectionhead"><h2>Audit trail</h2><span class="muted">Most recent 50 events</span></div><div id="events" class="empty">Connect to load events.</div></section></div><script>const $=id=>document.getElementById(id);function token(){return sessionStorage.getItem('aqas_admin_token')||''}function saveToken(){sessionStorage.setItem('aqas_admin_token',$('token').value.trim());refresh()}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function api(r,method='GET',body){const res=await fetch('?r='+encodeURIComponent(r),{method,headers:{'Authorization':'Bearer '+token(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store'});let d={};try{d=await res.json()}catch{}if(!res.ok)throw Error(d.error||'Request failed ('+res.status+')');return d}async function refresh(){if($('token').value)sessionStorage.setItem('aqas_admin_token',$('token').value.trim());$('message').textContent='Connecting…';try{const d=await api('aqas-status');loadAccts();loadFields();loadQs();loadAttention();loadNps();loadPay();try{const h=await api('aqas-health');$('health').innerHTML=h.cards.map(c=>`<div class="card"><div class="muted">${esc(c.label)}</div><h2 style="margin:6px 0 0">${esc(c.value)}</h2><div class="muted">${esc(c.note||'')}</div></div>`).join('')}catch(e){$('health').innerHTML=''}$('message').textContent='Connected · OpenAI key '+(d.openaiConfigured?'configured':'not configured')+' · live agent actions disabled';$('agents').innerHTML=d.agents.map(a=>`<div class="card"><div class="sectionhead"><h3>${esc(a.agent)}</h3><span class="status">${esc(a.status)}</span></div><div class="muted">${esc((a.metrics||{}).description||'Specialist agent')}</div><p>Mode: <b>${esc(a.mode)}</b></p><p>Daily contact cap: <b>${esc(a.daily_cap)}</b></p><div class="row"><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','paused')">Pause</button><button class="secondary" onclick="pauseAgent('${esc(a.agent)}','simulated')">Set simulated</button></div></div>`).join('');$('proposals').innerHTML=d.pendingProposals.length?d.pendingProposals.map(p=>`<div class="proposal"><div class="sectionhead"><h3>${esc(p.title)}</h3><span class="risk ${esc(p.risk)}">${esc(p.risk)} risk</span></div><div class="muted">${esc(p.agent)} · ${esc(p.created_at)}</div><p>${esc(p.rationale)}</p><p><b>Expected effect:</b> ${esc(p.expected_effect)}</p><p class="muted">Proposed change: ${esc(JSON.stringify(p.proposed_change))}</p><div class="row"><button onclick="decide(${p.id},'approved')">Approve record</button><button class="danger" onclick="decide(${p.id},'rejected')">Reject</button></div></div>`).join(''):'<div class="empty">No pending proposals.</div>';$('events').innerHTML=d.events.length?d.events.map(e=>`<div class="event"><div class="muted">${esc(e.occurred_at)} · ${esc(e.actor)} · ${esc(e.event_type)} ${e.agent?'· '+esc(e.agent):''}</div><div>${esc(e.summary)}</div></div>`).join(''):'<div class="empty">No events yet.</div>'}catch(e){$('message').textContent=e.message;$('agents').innerHTML='';$('proposals').innerHTML='<div class="empty">Not connected.</div>'}}function ringOf(coords){var r=coords.map(function(c){return [c[1],c[0]]});if(r.length>1&&r[0][0]===r[r.length-1][0]&&r[0][1]===r[r.length-1][1])r.pop();return r}
 function parseBoundary(text){
   var out=[],s=text.trim();
   if(s.charAt(0)==="<"){
@@ -2310,12 +2326,16 @@ function parseBoundary(text){
   return out.filter(function(f){return f.ring.length>=3&&f.ring.every(function(q){return Math.abs(q[0])<=90&&Math.abs(q[1])<=180})});
 }
 async function newClient(){const o=$('nc_out');try{const r=await api('aqas-create-client','POST',{name:$('nc_name').value,email:$('nc_email').value,plan:$('nc_plan').value,send:$('nc_send').checked});o.innerHTML='Created. Send this private link (it works for 7 days)'+(r.emailed?' <b>and it was emailed</b>':'')+':<br><input readonly style="width:100%" value="'+esc(r.link)+'" onclick="this.select()">';$('nc_name').value='';$('nc_email').value='';loadAccts()}catch(e){o.textContent=e.message}}
-function addFieldFor(uid){const i=document.createElement('input');i.type='file';i.accept='.geojson,.json,.kml';i.onchange=async()=>{const f=i.files[0];if(!f)return;try{const items=parseBoundary(await f.text());if(!items.length)return alert('No field outlines found in that file.');const crop=prompt('Crop for these fields? (optional)','')||'';let ok=0;for(const it of items.slice(0,20)){try{await api('aqas-add-farm','POST',{userId:uid,name:it.name||('Field '+(ok+1)),crop,geometry:{type:'Polygon',coordinates:[it.ring.map(q=>[q[1],q[0]]).concat([[it.ring[0][1],it.ring[0][0]]])]}});ok++}catch(e){alert('Added '+ok+'. '+e.message);break}}alert('Added '+ok+' field(s).');loadAccts();loadFields()}catch(e){alert('Could not read that file.')}};i.click()}
+function addFieldFor(uid){const i=document.createElement('input');i.type='file';i.accept='.geojson,.json,.kml';i.onchange=async()=>{const f=i.files[0];if(!f)return;try{const items=parseBoundary(await f.text());if(!items.length)return alert('No field outlines found in that file.');const crop=prompt('Crop for these fields? (optional)','')||'';let ok=0;for(const it of items.slice(0,50)){try{await api('aqas-add-farm','POST',{userId:uid,name:it.name||('Field '+(ok+1)),crop,geometry:{type:'Polygon',coordinates:[it.ring.map(q=>[q[1],q[0]]).concat([[it.ring[0][1],it.ring[0][0]]])]}});ok++}catch(e){alert('Added '+ok+'. '+e.message);break}}alert('Added '+ok+' field(s).');loadAccts();loadFields()}catch(e){alert('Could not read that file.')}};i.click()}
 async function loadFields(){try{const a=await api('aqas-fields'),s=a.summary,col={Dry:'#e0533c',Watch:'#f0a21b',Moist:'#2f9bd8'};$('fields').className='';$('fields').innerHTML='<p class="muted" style="margin:0 0 8px">'+s.fields+' fields · '+s.ha+' ha · '+s.dry+' dry · '+s.watch+' watch · '+s.stale+' with no fresh reading in 14 days</p>'+(a.fields.map(f=>`<div class="card" style="margin-top:8px;border-left:5px solid ${col[f.status]||'#8a9a92'}"><b>${esc(f.name)}</b> <span class="muted">${esc(f.crop)} · ${f.ha} ha</span><div class="muted">${esc(f.client)} · <b>${esc(f.status)}</b>${f.ndmi!==null?' ('+f.ndmi+')':''} · ${f.lastReading?('last reading '+esc(f.lastReading)):'no satellite reading yet'}</div></div>`).join('')||'<div class="empty">No fields yet.</div>')}catch(e){$('fields').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
 async function loadQs(){try{const a=await api('aqas-questions');$('qs').className='';$('qs').innerHTML=a.questions.map(q=>`<div class="card" style="margin-top:8px"><b>${esc(q.name||'Visitor')}</b> <span class="muted">${esc(q.email)} · ${esc(q.created.slice(0,10))}</span><p style="margin:6px 0">${esc(q.message)}</p>${q.reply?'<div class="muted">Your reply'+(q.public?' (shown on the website)':'')+': '+esc(q.reply)+'</div>':''}<textarea id="rp${q.id}" rows="2" style="width:100%" placeholder="Write a reply">${esc(q.reply)}</textarea><label><input id="rpp${q.id}" type="checkbox"${q.public?' checked':''}> show on the website FAQ</label> <button type="button" onclick="replyQ(${q.id})">Send reply</button></div>`).join('')||'<div class="empty">No questions yet.</div>'}catch(e){$('qs').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
 async function replyQ(id){try{await api('aqas-reply','POST',{id,reply:$('rp'+id).value,public:$('rpp'+id).checked});await loadQs()}catch(e){alert(e.message)}}
 async function loadAttention(){try{const a=await api('aqas-attention');const ic={high:'🔴',medium:'🟠',low:'⚪'};$('attn').className='';$('attn').innerHTML=a.items.length?a.items.map(i=>`<div class="card" style="margin-top:8px">${ic[i.level]} ${esc(i.text)}</div>`).join(''):'<div class="card">✅ Nothing needs your attention right now.</div>'}catch(e){$('attn').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
-async function runCheck(){const b=$('chkbtn');b.disabled=true;b.textContent='Checking…';try{const a=await api('aqas-selfcheck');const ic={ok:'✅',warn:'⚠️',fail:'❌'};$('chk').innerHTML='<p class="muted" style="margin:10px 0"><b>'+esc(a.summary)+'</b></p>'+a.checks.map(c=>`<div class="card" style="margin-top:8px"><b>${ic[c.status]} ${esc(c.name)}</b><div class="muted">${esc(c.detail)}</div>${c.fix?`<div style="margin-top:4px">${esc(c.fix)}</div>`:''}</div>`).join('')}catch(e){$('chk').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}b.disabled=false;b.textContent='Run check again'}async function loadAccts(){try{const a=await api('aqas-accounts');const s=a.summary,p=a.payments;$('accts').className='';$('accts').innerHTML='<div class="grid">'+[['Clients',s.total],['Paying',s.active],['Active this week',s.activeWeek],['Alumni spots left',Math.max(0,s.alumniTotal-s.alumni)]].map(x=>`<div class="card"><div class="muted">${x[0]}</div><h2 style="margin:6px 0 0">${x[1]}</h2></div>`).join('')+'</div><p class="muted" style="margin:10px 0">Payments: Stripe link '+(p.stripe?'on':'off')+' · PayPal link '+(p.paypal?'on':'off')+' · Stripe auto-update '+(p.webhook?'on':'off')+'</p>'+(a.accounts.map(u=>`<div class="card" style="margin-top:10px"><b>${esc(u.email)}</b>${u.disabled?' <span class="muted">(paused)</span>':''}<div class="muted">${esc(u.name)} · joined ${esc((u.created||'').slice(0,10))} · <b>${esc(u.activity)}</b> · last seen ${esc((u.lastSeen||'never').slice(0,10))}</div><div class="muted">${u.farms} fields, ${u.ha} ha · ${u.logs30} activity entries in 30 days · ${u.ai7} Advisor questions this week</div><div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><select onchange="setAcct(${u.id},{plan:this.value})">${['trial','alumni','basic','commercial','active','past_due','cancelled','free'].map(k=>`<option value="${k}"${k===u.plan?' selected':''}>${k}</option>`).join('')}</select><button type="button" onclick="addFieldFor(${u.id})">Add field from file</button><button type="button" onclick="setAcct(${u.id},{disabled:${u.disabled?'false':'true'}})">${u.disabled?'Resume':'Pause'} account</button></div></div>`).join('')||'<div class="empty">No accounts yet.</div>')}catch(e){$('accts').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}async function setAcct(id,body){try{await api('aqas-account','POST',Object.assign({id},body));await loadAccts()}catch(e){alert(e.message)}}async function pauseAgent(agent,status){try{await api('aqas-agent-control','POST',{agent,status});await refresh()}catch(e){alert(e.message)}}async function decide(id,status){const note=prompt('Review note (required for audit):');if(note===null)return;try{await api('aqas-decision','POST',{id,status,note});await refresh()}catch(e){alert(e.message)}}$('proposalForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('aqas-propose','POST',{agent:$('agent').value,risk:$('risk').value,title:$('title').value,rationale:$('rationale').value,expectedEffect:$('effect').value,change:$('change').value});e.target.reset();await refresh()}catch(err){alert(err.message)}});$('token').value=token();if(token())refresh();</script></body></html>
+async function loadNps(){try{const a=await api('aqas-nps');$('nps').className='';if(!a.responses){$('nps').innerHTML='<div class="card">No scores yet. Clients are asked for a 0 to 10 score two weeks after they join.</div>';return}const col=a.nps>=50?'#1a8f55':a.nps>=0?'#f0a21b':'#e0533c';$('nps').innerHTML=`<div class="card"><div class="muted">Net Promoter Score</div><h2 style="margin:4px 0;color:${col}">${a.nps}</h2><div class="muted">${a.responses} response${a.responses===1?'':'s'} · ${a.promoters} promoters · ${a.passives} passives · ${a.detractors} detractors${a.smallSample?' · small sample, treat with care':''}</div></div>`+a.recent.map(r=>`<div class="card" style="margin-top:8px"><b>${r.score}/10</b> ${esc(r.client)} <span class="muted">${esc(r.created)}</span>${r.comment?'<div>'+esc(r.comment)+'</div>':''}</div>`).join('')}catch(e){$('nps').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
+async function loadPay(){try{const a=await api('aqas-settings');const f=(k,l,ph)=>`<label>${l}</label><input id="ps_${k}" style="width:100%" value="${esc(a[k].value)}" placeholder="${ph}"><div class="muted" style="margin-bottom:8px">${a[k].source==='db'?'Saved here':a[k].source==='env'?'From a Render setting':'Not set'}</div>`;$('pay').className='';$('pay').innerHTML='<div class="card">'+f('stripe_link','Stripe link: season payment','https://buy.stripe.com/...')+f('stripe_acre_link','Stripe link: extra acres (adjustable quantity)','https://buy.stripe.com/...')+f('paypal_link','PayPal link','https://www.paypal.com/...')+f('stripe_label','Button text: season payment','Pay by card or Apple Pay')+f('acres_label','Button text: extra acres','Add extra acres')+'<button type="button" onclick="savePay()">Save payment settings</button><div id="ps_msg" class="muted" style="margin-top:6px"></div></div>'}catch(e){$('pay').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
+async function savePay(){const v={};['stripe_link','stripe_acre_link','paypal_link','stripe_label','acres_label'].forEach(k=>v[k]=$('ps_'+k).value);try{await api('aqas-settings','POST',{values:v});await loadPay();$('ps_msg').textContent='Saved. Clients see the new buttons right away.'}catch(e){$('ps_msg').textContent=e.message}}
+async function markPaid(id){const amount=prompt('Amount received (USD)?','250');if(amount===null)return;const method=prompt('How did they pay? paypal, stripe, cash, check or other','paypal');if(method===null)return;const note=prompt('Note, for example: 2027 founding season, 50 acres','2027 founding season');if(note===null)return;const plan=prompt('Set their plan to: alumni, basic, commercial or active','alumni');if(plan===null)return;try{await api('aqas-payment','POST',{userId:id,amount,method,note,plan});await loadAccts()}catch(e){alert(e.message)}}
+async function runCheck(){const b=$('chkbtn');b.disabled=true;b.textContent='Checking…';try{const a=await api('aqas-selfcheck');const ic={ok:'✅',warn:'⚠️',fail:'❌'};$('chk').innerHTML='<p class="muted" style="margin:10px 0"><b>'+esc(a.summary)+'</b></p>'+a.checks.map(c=>`<div class="card" style="margin-top:8px"><b>${ic[c.status]} ${esc(c.name)}</b><div class="muted">${esc(c.detail)}</div>${c.fix?`<div style="margin-top:4px">${esc(c.fix)}</div>`:''}</div>`).join('')}catch(e){$('chk').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}b.disabled=false;b.textContent='Run check again'}async function loadAccts(){try{const a=await api('aqas-accounts');const s=a.summary,p=a.payments;$('accts').className='';$('accts').innerHTML='<div class="grid">'+[['Clients',s.total],['Paying',s.active],['Active this week',s.activeWeek],['Alumni spots left',Math.max(0,s.alumniTotal-s.alumni)]].map(x=>`<div class="card"><div class="muted">${x[0]}</div><h2 style="margin:6px 0 0">${x[1]}</h2></div>`).join('')+'</div><p class="muted" style="margin:10px 0">Payments: Stripe link '+(p.stripe?'on':'off')+' · PayPal link '+(p.paypal?'on':'off')+' · Stripe auto-update '+(p.webhook?'on':'off')+'</p>'+(a.accounts.map(u=>`<div class="card" style="margin-top:10px"><b>${esc(u.email)}</b>${u.disabled?' <span class="muted">(paused)</span>':''}<div class="muted">${esc(u.name)} · joined ${esc((u.created||'').slice(0,10))} · <b>${esc(u.activity)}</b> · last seen ${esc((u.lastSeen||'never').slice(0,10))}</div><div class="muted">${u.farms} fields, ${u.ha} ha · ${u.logs30} activity entries in 30 days · ${u.ai7} Advisor questions this week${u.paid?' · Paid $'+u.paid.total+' (last '+esc((u.paid.last||'').slice(0,10))+')':''}</div><div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><select onchange="setAcct(${u.id},{plan:this.value})">${['trial','alumni','basic','commercial','active','past_due','cancelled','free'].map(k=>`<option value="${k}"${k===u.plan?' selected':''}>${k}</option>`).join('')}</select><button type="button" onclick="addFieldFor(${u.id})">Add field from file</button><button type="button" onclick="markPaid(${u.id})">Mark paid</button><button type="button" onclick="setAcct(${u.id},{disabled:${u.disabled?'false':'true'}})">${u.disabled?'Resume':'Pause'} account</button></div></div>`).join('')||'<div class="empty">No accounts yet.</div>')}catch(e){$('accts').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}async function setAcct(id,body){try{await api('aqas-account','POST',Object.assign({id},body));await loadAccts()}catch(e){alert(e.message)}}async function pauseAgent(agent,status){try{await api('aqas-agent-control','POST',{agent,status});await refresh()}catch(e){alert(e.message)}}async function decide(id,status){const note=prompt('Review note (required for audit):');if(note===null)return;try{await api('aqas-decision','POST',{id,status,note});await refresh()}catch(e){alert(e.message)}}$('proposalForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('aqas-propose','POST',{agent:$('agent').value,risk:$('risk').value,title:$('title').value,rationale:$('rationale').value,expectedEffect:$('effect').value,change:$('change').value});e.target.reset();await refresh()}catch(err){alert(err.message)}});$('token').value=token();if(token())refresh();</script></body></html>
 """
 
 
@@ -2432,6 +2452,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--mute);margin-top:8px}.legend i{display:inline-block;width:12px;height:12px;border-radius:4px;margin-right:5px;vertical-align:-1px}
 .steps4{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:6px 0 10px}.steps4 div{background:rgba(15,123,92,.09);border-radius:12px;padding:8px 10px;font-size:13px}.steps4 b{display:block;color:var(--wet)}
 .chart{touch-action:pan-y}
+.chipsrow{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}.spark{margin-left:auto;flex:none}.item .row{align-items:center;gap:8px}
 </style>
 </head>
 <body>
@@ -2474,9 +2495,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--wet);box-shadow:0 0 0
       <p id="area" class="help"></p>
       <button id="undo" class="b alt" type="button">Undo last corner</button><button id="clear" class="b alt" type="button">Clear</button><button id="save" class="b" type="button">Save farm</button>
     </div>
+    <div id="npsCard" class="panel" hidden style="margin-bottom:14px"></div><div id="startCard" class="panel" hidden style="margin-bottom:14px"></div>
     <div class="panel" id="ovPanel" hidden><h2>All your fields</h2><div id="ovmap" aria-label="Map of all fields"></div><div class="legend"><span><i style="background:#e0533c"></i>Dry</span><span><i style="background:#f0a21b"></i>Watch</span><span><i style="background:#2f9bd8"></i>Moist</span><span><i style="background:#8a9a92"></i>No reading yet</span><span>Tap a field to open it</span></div></div>
     <div class="grid">
-      <nav class="panel list" id="list" aria-label="Farms"></nav>
+      <nav class="panel list" id="list" aria-label="Farms"><div id="listTools"></div><div id="listItems"></div></nav>
       <section class="panel" id="detail" aria-live="polite"></section>
     </div>
     </div>
@@ -2531,7 +2553,8 @@ window.fwParseProbeCsv=function(text){var lines=text.replace(/\r/g,"").split("\n
 window.fwProbeCsv=function(fid){var i=document.createElement("input");i.type="file";i.accept=".csv,text/csv";i.onchange=function(){var f=i.files[0];if(!f)return;f.text().then(function(tx){var rows=window.fwParseProbeCsv(tx);if(rows===null)return alert("The file needs a date column and a moisture column.");if(!rows.length)return alert("No readings found in that file.");return fetch("?r=probe-upload",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({farmId:fid,readings:rows})}).then(function(r){return r.json()}).then(function(d){if(d.error)throw new Error(d.error);alert("Added "+d.stored+" daily reading"+(d.stored===1?"":"s")+(d.skipped?" ("+d.skipped+" skipped)":"")+".");document.dispatchEvent(new Event("fw-reload"))})}).catch(function(e){alert(e.message)})};i.click()};
 window.fwTip=function(e,svg){try{var s=JSON.parse(svg.getAttribute("data-s")),th=svg.getAttribute("data-th").split(","),p=+svg.getAttribute("data-p"),W=+svg.getAttribute("data-w"),r=svg.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W,i=Math.max(0,Math.min(s.length-1,Math.round((x-p)/(W-2*p)*(s.length-1)))),a=s[i],px=p+i*(W-2*p)/Math.max(1,s.length-1),st=a[1]<+th[0]?"Dry":a[1]<+th[1]?"Watch":"Moist",l=svg.querySelector(".cl");l.setAttribute("x1",px);l.setAttribute("x2",px);l.setAttribute("opacity",".5");svg.querySelector(".tt").textContent=a[0]+": moisture "+a[1].toFixed(2)+" ("+st+")"+(a[2]!=null?", greenness "+a[2].toFixed(2):"")}catch(_){}};
 (function(){var c=document.getElementById("installTip");if(!c)return;var sa=(window.matchMedia&&matchMedia("(display-mode: standalone)").matches)||navigator.standalone;if(sa)return;if(/iphone|ipad|ipod/i.test(navigator.userAgent)){c.innerHTML="📲 Install Farm Watch on your phone: tap <b>Share</b>, then <b>Add to Home Screen</b>.";c.hidden=false}window.addEventListener("beforeinstallprompt",function(e){e.preventDefault();c.innerHTML='📲 <a href="#" id="instGo"><b>Install Farm Watch</b></a> on this phone.';c.hidden=false;document.getElementById("instGo").onclick=function(ev){ev.preventDefault();e.prompt()}})})();
-window.fwPay=function(show){var c=document.getElementById("payCard");if(show===false){c.hidden=true;return}fetch("?r=me").then(function(r){return r.json()}).then(function(d){var u=d.user,p=d.pay||{};if(!u||(!p.stripe&&!p.paypal)){c.hidden=true;return}var L={trial:"Free trial",alumni:"Alumni farm",basic:"Basic",commercial:"Commercial",active:"Active subscription",past_due:"Payment issue",cancelled:"Cancelled",free:"Free"};var h="<h2>Your plan: "+(L[u.plan]||"Free pilot")+"</h2>";if(["active","free","alumni","basic","commercial"].indexOf(u.plan)<0){h+="<p class=\"help\" style=\"margin:0 0 10px\">Subscribe to keep Farm Watch running for your fields.</p>";if(p.stripe)h+="<a class=\"b\" style=\"display:block;text-align:center;text-decoration:none;margin-bottom:8px\" href=\""+p.stripe+"\" target=\"_blank\" rel=\"noopener\">Pay by card or Apple Pay</a>";if(p.paypal)h+="<a class=\"b alt\" style=\"display:block;text-align:center;text-decoration:none\" href=\""+p.paypal+"\" target=\"_blank\" rel=\"noopener\">Pay with PayPal</a><p class=\"help\" style=\"margin:8px 0 0\">PayPal payments are confirmed by our team, usually within a day.</p>"}else h+="<p class=\"help\" style=\"margin:0\">Thank you for being a customer.</p>";c.innerHTML=h;c.hidden=false}).catch(function(){c.hidden=true})};
+window.fwNps=function(show){var c=document.getElementById("npsCard");if(!c)return;if(show===false){c.hidden=true;return}fetch("?r=me").then(function(r){return r.json()}).then(function(d){if(!d.user||!d.npsDue){c.hidden=true;return}var h='<h2>How are we doing?</h2><p class="help" style="margin:0 0 10px">How likely are you to recommend Farm Watch to a friend or neighbor? (0 = not likely, 10 = very likely)</p><div style="display:grid;grid-template-columns:repeat(6,1fr);gap:6px">';for(var i=0;i<=10;i++)h+='<button type="button" class="b alt sm" data-s="'+i+'">'+i+'</button>';h+='</div><textarea id="npsC" rows="2" placeholder="What is the one thing we should improve? (optional)" style="width:100%;margin-top:10px"></textarea><div class="help" id="npsM" style="margin:6px 0 0">Tap a number to send.</div>';c.innerHTML=h;c.hidden=false;c.onclick=function(e){var b=e.target.closest("button[data-s]");if(!b)return;fetch("?r=nps",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({score:+b.getAttribute("data-s"),comment:document.getElementById("npsC").value})}).then(function(r){return r.json()}).then(function(x){if(x.error)throw new Error(x.error);c.innerHTML='<h2>Thank you!</h2><p class="help" style="margin:0">Your feedback goes straight to our team.</p>';setTimeout(function(){c.hidden=true},4000)}).catch(function(er){document.getElementById("npsM").textContent=er.message})}}).catch(function(){c.hidden=true})};
+window.fwPay=function(show){var c=document.getElementById("payCard");if(show===false){c.hidden=true;return}fetch("?r=me").then(function(r){return r.json()}).then(function(d){var u=d.user,p=d.pay||{};if(!u||(!p.stripe&&!p.paypal&&!p.stripeAcres)){c.hidden=true;return}var L={trial:"Free trial",alumni:"Alumni farm",basic:"Basic",commercial:"Commercial",active:"Active subscription",past_due:"Payment issue",cancelled:"Cancelled",free:"Free"},lb=p.labels||{},paid=["active","free","alumni","basic","commercial"].indexOf(u.plan)>=0,btn=function(h,t,alt){return "<a class=\"b"+(alt?" alt":"")+"\" style=\"display:block;text-align:center;text-decoration:none;margin-bottom:8px\" href=\""+h+"\" target=\"_blank\" rel=\"noopener\">"+t+"</a>"};var h="<h2>Your plan: "+(L[u.plan]||"Free trial")+"</h2>";if(!paid){h+="<p class=\"help\" style=\"margin:0 0 10px\">Subscribe to keep Farm Watch running for your fields.</p>";if(p.stripe)h+=btn(p.stripe,lb.stripe||"Pay by card or Apple Pay");if(p.paypal)h+=btn(p.paypal,"Pay with PayPal",1)+"<p class=\"help\" style=\"margin:0 0 8px\">PayPal payments are confirmed by our team, usually within a day.</p>"}else h+="<p class=\"help\" style=\"margin:0 0 10px\">Thank you for being a customer.</p>";if(p.stripeAcres)h+=btn(p.stripeAcres,lb.acres||"Add extra acres",paid?0:1);c.innerHTML=h;c.hidden=false}).catch(function(){c.hidden=true})};
 document.getElementById("delAcct").addEventListener("click",function(){var pw=prompt("This permanently deletes your account, farms, logs and labor records. It cannot be undone.\n\nType your password to confirm:");if(!pw)return;fetch("?r=deleteaccount",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||"Could not delete.");alert("Your account has been deleted.");location.reload()})}).catch(function(e){alert(e.message)})});</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -2561,7 +2584,7 @@ async function api(method,route,body){
 /* ---------- login ---------- */
 var INVITE=false,RESET=(new URLSearchParams(location.search)).get("reset")||"";
 function showAuth(){
-  $("app").hidden=true;$("who").hidden=true;$("delAcct").hidden=true;window.fwPay&&window.fwPay(false);$("auth").hidden=false;
+  $("app").hidden=true;$("who").hidden=true;$("delAcct").hidden=true;window.fwPay&&window.fwPay(false);window.fwNps&&window.fwNps(false);$("auth").hidden=false;
   var su=mode==="signup",fg=mode==="forgot",rs=mode==="reset";
   $("authTitle").textContent=su?"Create your account":fg?"Reset your password":rs?"Choose a new password":"Log in";
   $("authGo").textContent=su?"Create account":fg?"Send reset link":rs?"Save new password":"Log in";
@@ -2724,6 +2747,27 @@ function show(i){
     try{await api("POST","delfarm&id="+f.id);sel=null;say("Farm deleted.");await load()}catch(e){say(e.message,1)}
   });
 }
+var FILTER="All",QUERY="";
+function spark(f){var s=(f.series||[]).slice(-12);if(s.length<2)return "";var W=64,H=20,v=s.map(function(x){return x.ndmi}),mn=Math.min.apply(null,v),mx=Math.max.apply(null,v),d=s.map(function(x,i){return (i?"L":"M")+(i*W/(s.length-1)).toFixed(1)+" "+(H-2-(x.ndmi-mn)/Math.max(.02,mx-mn)*(H-4)).toFixed(1)}).join(" ");return '<svg class="spark" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" aria-hidden="true"><path d="'+d+'" fill="none" stroke="'+COL[lab(f)]+'" stroke-width="2" stroke-linecap="round"/></svg>'}
+function drawList(farms){
+  var tools=$("listTools"),box=$("listItems");
+  if(farms.length>=6){
+    if(!tools.innerHTML){tools.innerHTML='<input id="lq" type="search" placeholder="Search fields or crops" style="margin-bottom:8px"><div class="chipsrow" id="lf"></div>';
+      $("lq").addEventListener("input",function(){QUERY=this.value.toLowerCase();drawList(DATA.farms)});
+      $("lf").addEventListener("click",function(e){var b=e.target.closest("button[data-f]");if(b){FILTER=b.getAttribute("data-f");drawList(DATA.farms)}})}
+    $("lf").innerHTML=["All","Dry","Watch","Moist"].map(function(k){return '<button type="button" class="b '+(FILTER===k?'':'alt ')+'sm" data-f="'+k+'">'+k+'</button>'}).join("")
+  }else{tools.innerHTML="";FILTER="All";QUERY=""}
+  var idx=ORDER.filter(function(i){var f=farms[i];return (FILTER==="All"||lab(f)===FILTER)&&(!QUERY||(f.name+" "+(f.crop||"")).toLowerCase().indexOf(QUERY)>=0)});
+  box.innerHTML=idx.length?idx.map(function(i){var f=farms[i],l=lastOf(f);return '<button class="item" type="button" data-id="'+f.id+'" data-i="'+i+'"><div class="row"><b>'+esc(f.name)+'</b><span class="pill" style="color:'+COL[lab(f)]+'">'+lab(f)+'</span>'+spark(f)+'</div><div class="sub">'+esc(f.crop||"Crop not set")+(f.areaHa?", "+f.areaHa+" ha":"")+(l?", "+esc(ago(l.date)):"")+'</div></button>'}).join(""):'<p class="help" style="padding:14px;margin:0">'+(farms.length?"No fields match.":"No farms yet. Tap Add a farm.")+'</p>';
+  Array.prototype.forEach.call(box.querySelectorAll("button.item"),function(btn){btn.addEventListener("click",function(){show(parseInt(btn.getAttribute("data-i"),10))})});
+}
+function drawStart(farms){
+  var c=$("startCard");try{if(localStorage.getItem("fwStartHide")==="1"){c.hidden=true;return}}catch(e){}
+  var steps=[["Add your first field",farms.length>0],["Set the crop, soil and irrigation method on a field",farms.some(function(f){return f.crop&&f.soil&&f.irrigation})],["Get your first satellite reading",farms.some(function(f){return f.series&&f.series.length})],["Log your first irrigation or activity",farms.some(function(f){return f.logs&&f.logs.length})],["Tell us whether the advice matched your field",farms.some(function(f){return f.feedback})]];
+  var done=steps.filter(function(s){return s[1]}).length;if(done===steps.length){c.hidden=true;return}
+  c.innerHTML='<h2>Getting started · '+done+' of '+steps.length+'</h2><div style="height:8px;border-radius:9px;background:var(--line);overflow:hidden;margin:6px 0 10px"><div style="width:'+Math.round(done/steps.length*100)+'%;height:100%;background:var(--wet)"></div></div>'+steps.map(function(s){return '<div style="padding:4px 0">'+(s[1]?"✅ ":"⬜ ")+esc(s[0])+'</div>'}).join("")+'<p style="margin:10px 0 0"><button type="button" class="b alt sm" id="startHide">Hide this</button></p>';
+  c.hidden=false;$("startHide").onclick=function(){try{localStorage.setItem("fwStartHide","1")}catch(e){}c.hidden=true};
+}
 function render(){
   TH=DATA.thresholds||TH;var farms=DATA.farms;
   var b=DATA.briefing;
@@ -2742,8 +2786,8 @@ function render(){
   $("tiles").innerHTML=["Dry","Watch","Moist","No data"].map(function(k){return '<div class="tile"><b style="color:'+COL[k]+'">'+c[k]+'</b><span>'+k+'</span></div>'}).join("");
   var rank={Dry:0,Watch:1,Moist:2,"No data":3};
   ORDER=farms.map(function(f,i){return i}).sort(function(a,b){return rank[lab(farms[a])]-rank[lab(farms[b])]||farms[a].name.localeCompare(farms[b].name)});
-  $("list").innerHTML=ORDER.length?ORDER.map(function(i){var f=farms[i],l=lastOf(f);return '<button class="item" type="button" data-id="'+f.id+'" data-i="'+i+'"><div class="row"><b>'+esc(f.name)+'</b><span class="pill" style="color:'+COL[lab(f)]+'">'+lab(f)+'</span></div><div class="sub">'+esc(f.crop||"Crop not set")+(f.areaHa?", "+f.areaHa+" ha":"")+(l?", "+esc(ago(l.date)):"")+'</div></button>'}).join(""):'<p class="help" style="padding:14px;margin:0">No farms yet. Tap Add a farm.</p>';
-  Array.prototype.forEach.call(document.querySelectorAll("#list button"),function(btn){btn.addEventListener("click",function(){show(parseInt(btn.getAttribute("data-i"),10))})});
+  try{drawList(farms)}catch(e){var bx=$("listItems");bx.innerHTML=ORDER.map(function(i){return '<button class="item" type="button" data-i="'+i+'"><b>'+esc(farms[i].name)+'</b></button>'}).join("");Array.prototype.forEach.call(bx.querySelectorAll("button"),function(btn){btn.addEventListener("click",function(){show(parseInt(btn.getAttribute("data-i"),10))})})}
+  try{drawStart(farms)}catch(e){}
   if(!farms.length){$("detail").innerHTML='<h2>Welcome to Farm Watch</h2><p class="help" style="margin:0 0 6px">You will have your first advice in about two minutes:</p><ol class="steps"><li>Tap <b>Add a farm</b>, search for your village or town, switch the map to Satellite, and tap the corners of a field.</li><li>Tap <b>Save farm</b>. The 7-day forecast and irrigation advice appear straight away.</li><li>Tap <b>Update satellite data</b> to load the latest Sentinel-2 moisture readings. This can take up to a minute.</li><li>Come back each morning for your briefing, and log what you irrigate or spray.</li></ol>';return}
   var idx=ORDER[0];farms.forEach(function(f,i){if(f.id===sel)idx=i});show(idx);
 }
@@ -2764,7 +2808,7 @@ async function load(){
 async function enter(){
   var me=await api("GET","me");INVITE=!!me.inviteRequired;AI_ON=!!me.ai;
   if(!me.user){showAuth();return}
-  $("auth").hidden=true;$("app").hidden=false;$("who").hidden=false;$("delAcct").hidden=false;window.fwPay&&window.fwPay();$("whoName").textContent=me.user.name||me.user.email;
+  $("auth").hidden=true;$("app").hidden=false;$("who").hidden=false;$("delAcct").hidden=false;window.fwPay&&window.fwPay();window.fwNps&&window.fwNps();$("whoName").textContent=me.user.name||me.user.email;
   $("emailPref").checked=!!me.user.emailBriefing;
   await load();
 }
@@ -2848,7 +2892,7 @@ $("imp").addEventListener("change",async function(){
   var f=this.files[0];this.value="";if(!f)return;
   try{var items=parseBoundary(await f.text());
     if(!items.length)return say("No field outlines found in that file. Use a GeoJSON or KML file with polygons.",1);
-    if(items.length>20)items=items.slice(0,20);
+    if(items.length>50)items=items.slice(0,50);
     if(items.length===1){pts=items[0].ring;if(items[0].name&&!$("fn").value)$("fn").value=items[0].name;if(amap){amap.fitBounds(L.latLngBounds(pts),{padding:[30,30]})}redraw();return say("Boundary loaded. Check it, add the crop, then Save farm.")}
     if(!confirm("Add "+items.length+" fields from this file?"))return;
     var ok=0;
@@ -3110,19 +3154,98 @@ def config_warnings():
 STRIPE_PAYMENT_LINK = (os.environ.get("STRIPE_PAYMENT_LINK") or "").strip()
 PAYPAL_PAYMENT_LINK = (os.environ.get("PAYPAL_PAYMENT_LINK") or "").strip()
 STRIPE_WEBHOOK_SECRET = (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip()
+STRIPE_ACRE_LINK = (os.environ.get("STRIPE_ACRE_LINK") or "").strip()
 PLANS = ("trial", "alumni", "basic", "commercial", "active", "past_due", "cancelled", "free")
 PAID_PLANS = ("alumni", "basic", "commercial", "active")
+
+
+_SET_CACHE = {"at": 0.0, "vals": {}}
+SETTING_LABELS = {"stripe_link": "The Stripe season link", "stripe_acre_link": "The Stripe extra-acres link", "paypal_link": "The PayPal link",
+                  "stripe_label": "Season button text", "acres_label": "Extra-acres button text"}
+LINK_HOSTS = {"stripe_link": ("stripe.com",), "stripe_acre_link": ("stripe.com",), "paypal_link": ("paypal.com", "paypal.me")}
+
+
+def _env_setting(key):
+    return {"stripe_link": STRIPE_PAYMENT_LINK, "stripe_acre_link": STRIPE_ACRE_LINK, "paypal_link": PAYPAL_PAYMENT_LINK}.get(key, "")
+
+
+def get_setting(key):
+    """A value saved in the control room wins. Otherwise the Render setting is used."""
+    now = time.time()
+    if now - _SET_CACHE["at"] > 20:
+        try:
+            _SET_CACHE["vals"] = {r["skey"]: r["sval"] for r in sql("SELECT skey, sval FROM fw_settings")}
+        except Exception:
+            pass
+        _SET_CACHE["at"] = now
+    return ((_SET_CACHE["vals"].get(key) or "").strip()) or _env_setting(key)
+
+
+def settings_view():
+    out = {}
+    for k in SETTING_LABELS:
+        saved = (_SET_CACHE["vals"].get(k) or "").strip()
+        out[k] = {"value": get_setting(k), "source": "db" if saved else ("env" if _env_setting(k) else "unset")}
+    return out
+
+
+def save_settings(values):
+    clean = {}
+    for k, v in (values or {}).items():
+        if k not in SETTING_LABELS:
+            continue
+        v = (v or "").strip()
+        if k in LINK_HOSTS and v:
+            u = urlparse(v)
+            host = (u.hostname or "").lower()
+            if u.scheme != "https" or len(v) > 500 or not any(host == h or host.endswith("." + h) for h in LINK_HOSTS[k]):
+                raise ValueError("%s must be a full https link from %s." % (SETTING_LABELS[k], " or ".join(LINK_HOSTS[k])))
+        elif k not in LINK_HOSTS:
+            v = v[:60]
+        clean[k] = v
+    for k, v in clean.items():
+        sql("INSERT INTO fw_settings (skey, sval) VALUES ($1,$2) ON CONFLICT (skey) DO UPDATE SET sval = EXCLUDED.sval", (k, v))
+    _SET_CACHE["at"] = 0.0
+    return list(clean)
 
 
 def pay_links(user):
     """Payment buttons for a signed-in person. Stripe Payment Links include Apple Pay by default."""
     out = {}
-    if STRIPE_PAYMENT_LINK.startswith("https://"):
-        q = urlencode({"prefilled_email": user["email"], "client_reference_id": "fw_%d" % user["id"]})
-        out["stripe"] = STRIPE_PAYMENT_LINK + ("&" if "?" in STRIPE_PAYMENT_LINK else "?") + q
-    if PAYPAL_PAYMENT_LINK.startswith("https://"):
-        out["paypal"] = PAYPAL_PAYMENT_LINK
+    q = urlencode({"prefilled_email": user["email"], "client_reference_id": "fw_%d" % user["id"]})
+    for key, name in (("stripe_link", "stripe"), ("stripe_acre_link", "stripeAcres")):
+        link = get_setting(key)
+        if link.startswith("https://"):
+            out[name] = link + ("&" if "?" in link else "?") + q
+    pp = get_setting("paypal_link")
+    if pp.startswith("https://"):
+        out["paypal"] = pp
+    if out:
+        out["labels"] = {"stripe": get_setting("stripe_label") or "Pay by card or Apple Pay", "acres": get_setting("acres_label") or "Add extra acres"}
     return out
+
+
+def aqas_mark_paid(user_id, amount, method, note, plan):
+    """For payments that arrive outside Stripe, such as PayPal. Records the payment and sets the plan."""
+    try:
+        amt = float(amount)
+    except (TypeError, ValueError):
+        raise ValueError("Enter the amount as a number.")
+    if not 0 <= amt <= 1_000_000:
+        raise ValueError("Enter an amount between 0 and 1,000,000.")
+    method = (method or "other").strip().lower()
+    if method not in ("paypal", "stripe", "cash", "check", "other"):
+        raise ValueError("Payment method must be paypal, stripe, cash, check or other.")
+    plan = (plan or "alumni").strip().lower()
+    if plan not in PAID_PLANS:
+        raise ValueError("Choose alumni, basic, commercial or active.")
+    rows = sql("SELECT email FROM fw_users WHERE id=$1", (user_id,))
+    if not rows:
+        raise ValueError("Client not found.")
+    sql("INSERT INTO fw_payments (user_id, amount, method, note, created) VALUES ($1,$2,$3,$4,$5)",
+        (user_id, amt, method, (note or "").strip()[:200], datetime.now(timezone.utc).isoformat(timespec="seconds")))
+    sql("UPDATE fw_users SET plan=$1 WHERE id=$2", (plan, user_id))
+    return "%s: paid $%s via %s, plan set to %s" % (rows[0]["email"], ("%.2f" % amt).rstrip("0").rstrip("."), method, plan)
 
 
 def aqas_accounts():
@@ -3137,6 +3260,7 @@ def aqas_accounts():
         if int(r["farm_id"]) in farm_user:
             lc[farm_user[int(r["farm_id"])]] = lc.get(farm_user[int(r["farm_id"])], 0) + int(r["n"])
     cc = {int(r["user_id"]): int(r["n"]) for r in sql("SELECT user_id, COUNT(*) AS n FROM fw_chats WHERE created >= $1 GROUP BY user_id", (week,))}
+    paid = {int(r["user_id"]): r for r in sql("SELECT user_id, SUM(amount) AS total, MAX(created) AS last FROM fw_payments GROUP BY user_id")}
     out = []
     for u in users:
         f = fm.get(int(u["id"]))
@@ -3144,12 +3268,13 @@ def aqas_accounts():
                     "plan": u.get("plan") or "trial", "disabled": str(u.get("disabled") or "0") in ("1", "True", "true"),
                     "lastSeen": u.get("last_seen") or "", "farms": int(f["n"]) if f else 0, "ha": round(_f(f["ha"]) or 0, 1) if f else 0,
                     "logs30": lc.get(int(u["id"]), 0), "ai7": cc.get(int(u["id"]), 0),
+                    "paid": ({"total": round(_f(paid[int(u["id"])]["total"]) or 0, 2), "last": paid[int(u["id"])]["last"] or ""} if int(u["id"]) in paid else None),
                     "activity": ("invited" if not u.get("last_seen") else "active" if u["last_seen"][:10] >= week else "quiet" if u["last_seen"][:10] >= d30 else "inactive")})
     return {"accounts": out,
             "summary": {"total": len(out), "active": sum(1 for a in out if a["plan"] in PAID_PLANS), "alumni": sum(1 for a in out if a["plan"] == "alumni"),
                         "alumniTotal": ALUMNI_SLOTS, "activeWeek": sum(1 for a in out if a["activity"] == "active"), "invited": sum(1 for a in out if a["activity"] == "invited"),
                         "trial": sum(1 for a in out if a["plan"] == "trial"), "newWeek": sum(1 for a in out if (a["created"] or "") >= week)},
-            "payments": {"stripe": STRIPE_PAYMENT_LINK.startswith("https://"), "paypal": PAYPAL_PAYMENT_LINK.startswith("https://"),
+            "payments": {"stripe": get_setting("stripe_link").startswith("https://"), "paypal": get_setting("paypal_link").startswith("https://"),
                          "webhook": bool(STRIPE_WEBHOOK_SECRET)}}
 
 
@@ -3196,8 +3321,12 @@ def handle_stripe_event(ev):
             uid = int(r[0]["id"]) if r else None
         if uid is None:
             return "no matching account"
-        sql("UPDATE fw_users SET plan=$1, stripe_customer=$2 WHERE id=$3", ("active", cust, uid))
-        return "account %d active" % uid
+        cur = sql("SELECT plan FROM fw_users WHERE id=$1", (uid,))
+        keep = cur and (cur[0].get("plan") or "") in PAID_PLANS
+        sql("UPDATE fw_users SET plan=$1, stripe_customer=$2 WHERE id=$3", ((cur[0]["plan"] if keep else "active"), cust, uid))
+        sql("INSERT INTO fw_payments (user_id, amount, method, note, created) VALUES ($1,$2,$3,$4,$5)",
+            (uid, round((obj.get("amount_total") or 0) / 100, 2), "stripe", "Stripe checkout", datetime.now(timezone.utc).isoformat(timespec="seconds")))
+        return "account %d %s" % (uid, "payment recorded" if keep else "active")
     newplan = {"invoice.paid": "active", "invoice.payment_failed": "past_due", "customer.subscription.deleted": "cancelled"}.get(typ)
     if newplan and cust:
         sql("UPDATE fw_users SET plan=$1 WHERE stripe_customer=$2", (newplan, cust))
@@ -3236,7 +3365,11 @@ def aqas_selfcheck():
         fc = fetch_forecast_remote(40.4, -3.7)
         add("Weather (Open-Meteo)", "ok" if fc and fc[0] else "warn", "Forecast received." if fc and fc[0] else "Empty forecast returned.")
     except Exception as ex:
-        add("Weather (Open-Meteo)", "fail", str(ex)[:140], "Open-Meteo may be down. If it persists, check OPEN_METEO_API_KEY.")
+        if "429" in str(ex):
+            add("Weather (Open-Meteo)", "fail", "Open-Meteo is limiting requests from your hosting provider's shared address (HTTP 429).",
+                "Subscribe to an Open-Meteo API plan and add the key as OPEN_METEO_API_KEY in Render. That removes this limit, and a paid plan is required for commercial use anyway.")
+        else:
+            add("Weather (Open-Meteo)", "fail", str(ex)[:140], "Open-Meteo may be down. If it persists, check OPEN_METEO_API_KEY.")
     prov = ai_provider()
     if not prov:
         add("AI advisor", "warn", "No AI key is set, so the Advisor tab is off.", "Add ANTHROPIC_API_KEY (or GEMINI_API_KEY with AI_PROVIDER=gemini) in Render.")
@@ -3250,9 +3383,9 @@ def aqas_selfcheck():
         add("Email", "ok", "SMTP settings are present. Emails will be sent with them.")
     else:
         add("Email", "warn", "Email is off, so there are no morning briefings or password-reset emails.", "Add SMTP_HOST, SMTP_USER, SMTP_PASS and ALERT_FROM in Render.")
-    for label, link in (("Stripe payment link", STRIPE_PAYMENT_LINK), ("PayPal payment link", PAYPAL_PAYMENT_LINK)):
+    for label, link in (("Stripe payment link", get_setting("stripe_link")), ("PayPal payment link", get_setting("paypal_link"))) + ((("Stripe extra-acres link", get_setting("stripe_acre_link")),) if get_setting("stripe_acre_link") else ()):
         if not link:
-            add(label, "warn", "Not set.", "Add %s in Render." % ("STRIPE_PAYMENT_LINK" if "Stripe" in label else "PAYPAL_PAYMENT_LINK"))
+            add(label, "warn", "Not set.", "Paste it in the Payments section of this control room.")
         elif not link.startswith("https://"):
             add(label, "fail", "The link must start with https://.", "Paste the full link from your dashboard.")
         else:
@@ -3267,7 +3400,7 @@ def aqas_selfcheck():
                 add(label, "fail", "The provider returned HTTP %s." % ex.code, "The link may be inactive or deleted. Create it again.")
             except Exception as ex:
                 add(label, "warn", "Could not test the link: %s" % str(ex)[:100], "Open it on your phone to confirm.")
-    if STRIPE_PAYMENT_LINK:
+    if get_setting("stripe_link") or get_setting("stripe_acre_link"):
         if not STRIPE_WEBHOOK_SECRET:
             add("Stripe webhook", "fail", "No signing secret, so payments will not mark accounts as paid.", "Add STRIPE_WEBHOOK_SECRET in Render.")
         elif LAST_WEBHOOK["at"]:
@@ -3779,9 +3912,52 @@ def aqas_attention():
             items.append({"level": "high", "text": "%d unanswered question%s from the website." % (len(qs), "" if len(qs) == 1 else "s")})
     except Exception:
         pass
+    try:
+        cut = (date.today() - timedelta(days=30)).isoformat()
+        un = [r for r in aqas_nps()["recent"] if r["score"] <= 6 and r["created"] >= cut]
+        if un:
+            items.append({"level": "high", "text": "%d unhappy client score%s in the last 30 days: %s." % (len(un), "" if len(un) == 1 else "s", "; ".join("%s gave %d%s" % (r["client"], r["score"], (" (" + r["comment"][:80] + ")") if r["comment"] else "") for r in un[:3]))})
+    except Exception:
+        pass
     order = {"high": 0, "medium": 1, "low": 2}
     items.sort(key=lambda x: order[x["level"]])
     return {"items": items}
+
+
+def nps_due(uid):
+    """Ask for a satisfaction score once an account is two weeks old, then every 60 days."""
+    r = sql("SELECT created FROM fw_users WHERE id=$1", (uid,))
+    try:
+        age = (date.today() - date.fromisoformat(str(r[0]["created"])[:10])).days
+    except (IndexError, ValueError, TypeError):
+        return False
+    if age < 14:
+        return False
+    cut = (date.today() - timedelta(days=60)).isoformat()
+    return not sql("SELECT id FROM fw_nps WHERE user_id=$1 AND created >= $2 LIMIT 1", (uid, cut))
+
+
+def submit_nps(uid, score, comment):
+    try:
+        s = int(score)
+    except (TypeError, ValueError):
+        raise ValueError("Choose a score from 0 to 10.")
+    if not 0 <= s <= 10:
+        raise ValueError("Choose a score from 0 to 10.")
+    sql("INSERT INTO fw_nps (user_id, score, comment, created) VALUES ($1,$2,$3,$4)",
+        (uid, s, (comment or "").strip()[:500], datetime.now(timezone.utc).isoformat(timespec="seconds")))
+
+
+def aqas_nps():
+    """Net Promoter Score: percent who score 9 or 10 minus percent who score 0 to 6."""
+    ensure_schema()
+    rows = sql("SELECT n.score, n.comment, n.created, u.email, u.name FROM fw_nps n JOIN fw_users u ON u.id = n.user_id ORDER BY n.id DESC LIMIT 200")
+    total = len(rows)
+    pro = sum(1 for r in rows if int(r["score"]) >= 9)
+    det = sum(1 for r in rows if int(r["score"]) <= 6)
+    return {"nps": round((pro - det) / total * 100) if total else None, "responses": total, "promoters": pro, "detractors": det,
+            "passives": total - pro - det, "smallSample": total < 10,
+            "recent": [{"client": r["name"] or r["email"], "score": int(r["score"]), "comment": r["comment"] or "", "created": (r["created"] or "")[:10]} for r in rows[:15]]}
 
 
 class handler(BaseHTTPRequestHandler):
@@ -3892,7 +4068,7 @@ class handler(BaseHTTPRequestHandler):
                 return self._send(200, AQAS_HTML.encode("utf-8"), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
             if r == "health":
                 return self._json(200, {"ok": True, "aqas": "phase-1-simulated"})
-            if r in ("aqas-status", "aqas-events", "aqas-proposals", "aqas-health", "aqas-accounts", "aqas-selfcheck", "aqas-fields", "aqas-questions", "aqas-attention"):
+            if r in ("aqas-status", "aqas-events", "aqas-proposals", "aqas-health", "aqas-accounts", "aqas-selfcheck", "aqas-fields", "aqas-questions", "aqas-attention", "aqas-nps", "aqas-settings"):
                 if not self._aqas_gate():
                     return
                 if r == "aqas-health":
@@ -3905,6 +4081,12 @@ class handler(BaseHTTPRequestHandler):
                     return self._json(200, aqas_fields())
                 if r == "aqas-attention":
                     return self._json(200, aqas_attention())
+                if r == "aqas-nps":
+                    return self._json(200, aqas_nps())
+                if r == "aqas-settings":
+                    ensure_schema()
+                    get_setting("stripe_link")
+                    return self._json(200, settings_view())
                 if r == "aqas-questions":
                     return self._json(200, aqas_questions())
                 snap = aqas_snapshot()
@@ -3920,7 +4102,7 @@ class handler(BaseHTTPRequestHandler):
             ensure_schema()
             user = self._user()
             if r == "me":
-                return self._json(200, {"user": user, "inviteRequired": bool(INVITE_CODE), "ai": bool(ai_provider()), "pay": pay_links(user) if user else {}})
+                return self._json(200, {"user": user, "inviteRequired": bool(INVITE_CODE), "ai": bool(ai_provider()), "pay": pay_links(user) if user else {}, "npsDue": nps_due(user["id"]) if user else False})
             if r == "map":
                 fid = self._query().get("id", "")
                 rows = sql("SELECT m.png FROM fw_maps m JOIN fw_farms f ON f.id = m.farm_id "
@@ -4025,6 +4207,14 @@ class handler(BaseHTTPRequestHandler):
                     return
                 ensure_aqas_schema()
                 actor = "control-room-admin"
+                if r == "aqas-settings":
+                    saved = save_settings(data.get("values"))
+                    aqas_event(actor, "payment_settings_changed", ", ".join(saved)[:120])
+                    return self._json(200, {"ok": True})
+                if r == "aqas-payment":
+                    msg = aqas_mark_paid(int(data.get("userId") or 0), data.get("amount"), data.get("method"), data.get("note"), data.get("plan"))
+                    aqas_event(actor, "payment_recorded", msg[:200])
+                    return self._json(200, {"ok": True, "message": msg})
                 if r == "aqas-create-client":
                     res = aqas_create_client(data.get("email"), data.get("name"), data.get("plan") or "trial", self._base_url(), bool(data.get("send")))
                     aqas_event(actor, "client_created", (data.get("email") or "")[:120])
@@ -4127,6 +4317,9 @@ class handler(BaseHTTPRequestHandler):
                     raise ValueError("Missing log id.")
                 delete_log(user["id"], int(lid))
                 return self._json(200, {"deleted": True})
+            if r == "nps":
+                submit_nps(user["id"], data.get("score"), data.get("comment"))
+                return self._json(200, {"ok": True})
             if r == "probe-key":
                 return self._json(200, {"key": probe_key_for(user["id"], int(data.get("farmId") or 0), bool(data.get("reset")))})
             if r == "probe-upload":
